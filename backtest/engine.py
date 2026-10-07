@@ -61,7 +61,7 @@ from risk.positions import (
     PositionStore,
     simulated_clock,
 )
-from risk.risk_manager import RiskManager, btc_correlation
+from risk.risk_manager import REASON_TEXT, RiskManager, btc_correlation
 
 log = logging.getLogger(__name__)
 
@@ -299,6 +299,7 @@ class Backtester:
         equity = np.empty(len(steps))
         open_count = np.zeros(len(steps), dtype="int64")
         open_positions: dict[int, Position] = {}
+        correlations: dict[tuple[str, int], float] = {}
         current_day: int | None = None
         report_every = max(len(steps) // 10, 1)
 
@@ -327,13 +328,23 @@ class Backtester:
 
             # c. Entry: sinyal candle ini, skor tertinggi dulu.
             for signal in rank_signals(by_step.get(i, [])):
+                # Penolakan yang pasti (sama dengan risk manager) dicek murah lebih dulu:
+                # slot maksimal sudah terisi, atau coin ini sudah punya posisi.
+                if len(open_positions) >= settings.max_open_positions:
+                    stats.skipped[REASON_TEXT["posisi_penuh"]] += 1
+                    continue
+                if any(p.symbol == signal.symbol for p in open_positions.values()):
+                    stats.skipped[REASON_TEXT["sudah_ada_posisi"]] += 1
+                    continue
                 price = series[signal.symbol].last_close(i)
                 if price is None:
                     stats.skipped["tanpa_harga"] += 1
                     continue
                 executor.set_price(signal.symbol, price)
-                corr = btc_correlation(series[signal.symbol].hourly_closes(i), btc.hourly_closes(i))
-                attempt = await manager.try_open(signal, risk, settings, btc_corr=corr)
+                hour_key = (signal.symbol, int(series[signal.symbol].count_1h[i]))
+                if hour_key not in correlations:  # close 1h hanya berubah sekali per jam
+                    correlations[hour_key] = btc_correlation(series[signal.symbol].hourly_closes(i), btc.hourly_closes(i))
+                attempt = await manager.try_open(signal, risk, settings, btc_corr=correlations[hour_key])
                 if attempt.opened and attempt.position is not None:
                     stats.opened += 1
                     open_positions[int(attempt.position.id)] = attempt.position

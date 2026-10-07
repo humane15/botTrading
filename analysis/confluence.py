@@ -383,15 +383,21 @@ class ConfluenceEngine:
         return tuple(codes)
 
     def _certain_rejections(
-        self, trend: TrendContext, structure: Sequence[SignalScore], setup: SetupContext, setup_f: pd.DataFrame, market: MarketContext
+        self,
+        trend: TrendContext,
+        structure: Sequence[SignalScore],
+        setup: SetupContext,
+        plan: TradePlan,
+        penalty: float,
+        market: MarketContext,
     ) -> tuple[str, ...]:
-        """Alasan tolak yang SUDAH PASTI dari timeframe 1h/30m/15m dan kondisi pasar.
+        """Alasan tolak yang SUDAH PASTI sebelum analisis 5m dijalankan.
 
         Dipakai evaluate(fast_reject=True) untuk melewati analisis 5m yang hasilnya
         pasti ditolak. Setiap kode di sini pasti juga muncul pada evaluasi penuh:
         * jumlah timeframe searah paling banyak (searah di 1h/30m/15m) + 1;
-        * skor paling tinggi dihitung dengan skor 5m = +1 dan penalti yang belum
-          pasti dianggap serendah mungkin.
+        * ruang ke resistance dari rencana SL/TP (tidak bergantung pada analisis 5m);
+        * skor paling tinggi dihitung dengan skor 5m = +1 dan penalti yang sudah pasti.
         """
         p = self.params
         tf_trend, tf_struct, tf_setup, tf_trig = (p.timeframe_of(r) for r in ("trend", "structure", "setup", "trigger"))
@@ -407,23 +413,12 @@ class ConfluenceEngine:
         if sum(ts.aligned for ts in higher.values()) + 1 < p.min_aligned:
             codes.append("tf_tidak_searah")
 
+        if plan.reward_risk < p.min_reward_risk:
+            codes.append("rr_kurang")
         tf_weights, total_tf = self._timeframe_weights()
         raw_max = (sum(tf_weights[tf] * ts.score for tf, ts in higher.items()) + tf_weights[tf_trig] * 1.0) / total_tf
-        known = []
-        if trend.direction != TREND_UP:
-            known.append("melawan_tren_1h")
-        rsi_setup = _value(setup_f, "rsi")
-        if is_valid(rsi_setup) and rsi_setup >= p.late_rsi:
-            known.append("entry_terlambat")
-        if market.btc_change_1h <= p.btc_dump_change:
-            known.append("btc_dump")
-        unknown = [c for c in ("dekat_resistance", "volume_lemah", "entry_terlambat") if c not in known]
-        penalty_min = sum(self.weights.get(f"penalty.{c}", 0.0) for c in known)
-        penalty_min += sum(min(self.weights.get(f"penalty.{c}", 0.0), 0.0) for c in unknown)
-        if market.btc_regime is not None and not market.btc_regime.allows_entry:
-            penalty_min += self.weights.get("penalty.btc_turun", 0.0)
         # 1e-6: cadangan pembulatan float agar batas atas tidak pernah di bawah skor sebenarnya.
-        score_max = round(min(max(50.0 * (1.0 + raw_max - penalty_min) + 1e-6, 0.0), 100.0), 2)
+        score_max = round(min(max(50.0 * (1.0 + raw_max - penalty) + 1e-6, 0.0), 100.0), 2)
         if score_max < p.min_score:
             codes.append("skor_rendah")
         return tuple(codes)
@@ -465,7 +460,14 @@ class ConfluenceEngine:
         setup: SetupContext = self._cached(
             symbol, "setup", (_fingerprint(setup_f), trend_key), lambda: self._analyze_setup(setup_f, trend_f, trend)
         )
-        if fast_reject and (certain := self._certain_rejections(trend, structure, setup, setup_f, market)):
+        # Rencana SL/TP dan kondisi berisiko tidak bergantung pada analisis 5m (hanya harga
+        # penutupan dan nilai indikator), jadi dihitung lebih dulu.
+        plan = self._trade_plan(frames, setup.zones, setup.fib_leg)
+        conditions = self._conditions(trend.direction, plan, setup_f, trig_f, market)
+        penalty = sum(self.weights.get(f"penalty.{c}", 0.0) for c in conditions)
+        if market.btc_regime is not None and not market.btc_regime.allows_entry:
+            penalty += self.weights.get("penalty.btc_turun", 0.0)
+        if fast_reject and (certain := self._certain_rejections(trend, structure, setup, plan, penalty, market)):
             return self._fast_rejected(symbol, timestamp, trend, market, certain)
         trigger = self._analyze_trigger(trig_f, trend)
         regime, ma_trend, trend_dir = trend.regime, trend.ma, trend.direction
@@ -475,12 +477,6 @@ class ConfluenceEngine:
         tf_weights, total_tf = self._timeframe_weights()
         raw = sum(tf_weights[tf] * tf_scores[tf].score for tf in tf_scores) / total_tf
         aligned = sum(1 for ts in tf_scores.values() if ts.aligned)
-
-        plan = self._trade_plan(frames, setup.zones, setup.fib_leg)
-        conditions = self._conditions(trend_dir, plan, setup_f, trig_f, market)
-        penalty = sum(self.weights.get(f"penalty.{c}", 0.0) for c in conditions)
-        if market.btc_regime is not None and not market.btc_regime.allows_entry:
-            penalty += self.weights.get("penalty.btc_turun", 0.0)
         score = round(min(max(50.0 * (1.0 + raw - penalty), 0.0), 100.0), 2)
 
         tags_by_tf = {tf: {tag for s in ts.signals for tag in s.tags} for tf, ts in tf_scores.items()}

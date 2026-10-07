@@ -99,6 +99,7 @@ class PositionManager:
         self.executor = executor
         self.config = config or ManagerConfig()
         self.events: list[str] = []
+        self._recorded: dict[str, tuple[str, float]] = {}  # status order terakhir yang sudah ditulis ke database
 
     @property
     def mode(self) -> str:
@@ -332,8 +333,10 @@ class PositionManager:
 
     def _apply_fill(self, position: Position, role: str, order: OrderResult, reason: str) -> None:
         """Catat bagian order yang baru terisi sejak sync terakhir."""
-        if order.status != "not_found":
-            self.store.record_order(position.id, role, order)
+        state = (order.status, order.filled)
+        if order.status != "not_found" and self._recorded.get(order.client_id) != state:
+            self.store.record_order(position.id, role, order)  # hanya jika status atau jumlah terisi berubah
+            self._recorded[order.client_id] = state
         recorded = getattr(position, f"{role}_filled")
         new_qty = order.filled - recorded
         if new_qty <= 1e-12:

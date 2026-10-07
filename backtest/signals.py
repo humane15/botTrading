@@ -16,9 +16,10 @@ backtest/engine.py) lalu memproses sinyal ini secara berurutan waktu.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from multiprocessing import get_context
@@ -131,6 +132,43 @@ def market_contexts(
     return contexts
 
 
+class FeatureVector(Mapping[str, float]):
+    """Fitur sinyal dalam satu array numpy dengan daftar nama yang dipakai bersama.
+
+    Backtest 6 bulan bisa menghasilkan ratusan ribu sinyal entry; dict biasa
+    dengan puluhan kunci per sinyal memakan beberapa GB memori.
+    """
+
+    __slots__ = ("_keys", "_values")
+
+    def __init__(self, keys: tuple[str, ...], values: np.ndarray) -> None:
+        self._keys = keys
+        self._values = values
+
+    def __getitem__(self, key: str) -> float:
+        try:
+            return float(self._values[self._keys.index(key)])
+        except ValueError:
+            raise KeyError(key) from None
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._keys)
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def __reduce__(self) -> tuple[object, ...]:
+        return (FeatureVector, (self._keys, self._values))
+
+
+def compact_signal(signal: SignalResult, shared_keys: dict[tuple[str, ...], tuple[str, ...]]) -> SignalResult:
+    """Sinyal entry versi ringkas untuk simulasi: tanpa rincian skor per timeframe, fitur dalam array."""
+    keys = tuple(signal.features)
+    keys = shared_keys.setdefault(keys, keys)
+    values = np.fromiter(signal.features.values(), dtype="float64", count=len(keys))
+    return dataclasses.replace(signal, timeframes={}, tags=(), features=FeatureVector(keys, values))
+
+
 @dataclass
 class SymbolSignals:
     symbol: str
@@ -157,13 +195,14 @@ def symbol_signals(
     engine = ConfluenceEngine(weights, params)
     slicer = WindowSlicer(frames, steps_ms, window)
     trigger_tf = params.timeframe_of("trigger")
+    shared_keys: dict[tuple[str, ...], tuple[str, ...]] = {}
     for i in np.flatnonzero(active):
         if not slicer.closes_at(trigger_tf, int(i)):
             continue  # candle 5m langkah ini tidak ada (belum listing atau data bolong)
         signal = engine.evaluate(symbol, slicer.windows(int(i)), contexts[int(i)], fast_reject=True)
         result.evaluations += 1
         if signal.is_entry:
-            result.entries.append(signal)
+            result.entries.append(compact_signal(signal, shared_keys))
         else:
             result.rejections.update(signal.rejections)
     return result
