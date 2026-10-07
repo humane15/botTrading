@@ -254,4 +254,4 @@ def test_validasi_parameter_data_feed(client):
     with pytest.raises(ValueError):
         DataFeed(client, ["5m", "7m"])
     with pytest.raises(ValueError):
-        DataFeed(client, ["5m"], limit=1000)
+        DataFeed(client, ["5m"], limit=1001)

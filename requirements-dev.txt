@@ -2,3 +2,6 @@
 pytest>=8.0
 pytest-mock>=3.12
 pytest-asyncio>=0.23
+# Hanya untuk test pembanding: indikator bot dicocokkan dengan TA-Lib.
+# Bot sendiri tidak membutuhkan TA-Lib (indikator ditulis dengan pandas/numpy).
+TA-Lib>=0.6

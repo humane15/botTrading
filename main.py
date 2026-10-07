@@ -4,6 +4,8 @@ Contoh pemakaian:
     python main.py universe              tampilkan 75 coin (cache 24 jam)
     python main.py universe --refresh    paksa pilih ulang dari Binance
     python main.py fetch SOL/USDT        ambil candle 5m, 15m, 30m, 1h
+    python main.py analyze SOL/USDT      analisis lengkap satu coin (skor, alasan, rencana)
+    python main.py scan --top 10         analisis semua coin universe, tampilkan sinyal teratas
     python main.py backtest              backtest (Fase 4)
     python main.py train                 latih model ML (Fase 5)
     python main.py report                laporan performa (Fase 4 dan 5)
@@ -21,8 +23,20 @@ from datetime import datetime, timezone
 from typing import Any, TypeVar
 
 import ccxt
+import pandas as pd
 from pydantic import ValidationError
 
+from analysis.confluence import (
+    ConfluenceEngine,
+    EngineParams,
+    SignalResult,
+    describe_signal,
+    format_signal,
+    prepare_frames,
+    rank_signals,
+)
+from analysis.regime import CircuitBreaker, MarketContext, analyze_market
+from analysis.weights import WeightStore
 from config.logging_setup import setup_logging
 from config.settings import (
     DEFAULT_ENV_FILE,
@@ -52,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_fetch = sub.add_parser("fetch", help="ambil candle multi timeframe untuk satu simbol")
     p_fetch.add_argument("symbol", help="contoh: SOL/USDT")
+
+    p_analyze = sub.add_parser("analyze", help="analisis teknikal lengkap satu simbol")
+    p_analyze.add_argument("symbol", help="contoh: SOL/USDT")
+
+    p_scan = sub.add_parser("scan", help="analisis semua coin universe dan tampilkan sinyal teratas")
+    p_scan.add_argument("--top", type=int, default=10, help="jumlah sinyal yang ditampilkan (default 10)")
 
     sub.add_parser("backtest", help="jalankan backtest (Fase 4)")
     sub.add_parser("report", help="laporan performa (Fase 4 dan 5)")
@@ -126,6 +146,90 @@ async def run_fetch(settings: Settings, client: ExchangeClient, symbol: str) -> 
     return 0
 
 
+def build_engine(settings: Settings) -> ConfluenceEngine:
+    """Confluence engine dengan bobot dari database (data/bot.db)."""
+    store = WeightStore.open(settings.db_path)
+    try:
+        weights = store.snapshot()
+    finally:
+        store.conn.close()
+    return ConfluenceEngine(weights, EngineParams.from_settings(settings))
+
+
+def build_breaker(settings: Settings) -> CircuitBreaker:
+    return CircuitBreaker(drop_threshold=settings.circuit_breaker_drop, cooldown=pd.Timedelta(hours=settings.circuit_breaker_hours))
+
+
+async def market_context(
+    feed: DataFeed, engine: ConfluenceEngine, settings: Settings, breaker: CircuitBreaker, btc_frames: Mapping[str, Any] | None = None
+) -> MarketContext:
+    """Regime BTC dan status circuit breaker (BTC sebagai acuan pasar)."""
+    raw = btc_frames if btc_frames is not None else await feed.get_multi_timeframe(settings.btc_symbol)
+    frames = prepare_frames(raw, engine.params.indicators)
+    return analyze_market(
+        frames,
+        breaker,
+        trend_timeframe=engine.params.timeframe_of("trend"),
+        breaker_timeframe=engine.params.timeframe_of("trigger"),
+        params=engine.params.regime,
+    )
+
+
+async def run_analyze(settings: Settings, client: ExchangeClient, symbol: str) -> int:
+    symbol = symbol.upper()
+    markets = await client.load_markets()
+    if symbol not in markets:
+        print(f"Simbol {symbol} tidak ditemukan di Binance spot", file=sys.stderr)
+        return 1
+    try:
+        await client.sync_time()
+    except ccxt.BaseError as exc:
+        print(f"Sinkron waktu gagal, memakai jam lokal: {exc}", file=sys.stderr)
+    feed = DataFeed.from_settings(client, settings)
+    engine = build_engine(settings)
+    market = await market_context(feed, engine, settings, build_breaker(settings))
+    frames = prepare_frames(await feed.get_multi_timeframe(symbol), engine.params.indicators)
+    print(describe_signal(engine.evaluate(symbol, frames, market)))
+    return 0
+
+
+async def run_scan(settings: Settings, client: ExchangeClient, top: int = 10) -> int:
+    universe = await UniverseSelector(client, settings).get_universe()
+    try:
+        await client.sync_time()
+    except ccxt.BaseError as exc:
+        print(f"Sinkron waktu gagal, memakai jam lokal: {exc}", file=sys.stderr)
+    feed = DataFeed.from_settings(client, settings)
+    engine = build_engine(settings)
+    symbols = list(dict.fromkeys([*universe.symbols, settings.btc_symbol]))
+    refresh = await feed.refresh(symbols)
+    complete = set(refresh.complete_symbols(engine.params.timeframes))
+    if settings.btc_symbol in complete:
+        btc_frames = refresh.data[settings.btc_symbol]
+        market = await market_context(feed, engine, settings, build_breaker(settings), btc_frames)
+    else:
+        print(f"Data {settings.btc_symbol} tidak lengkap: regime BTC dan circuit breaker tidak diketahui", file=sys.stderr)
+        market = MarketContext()
+
+    results: list[SignalResult] = []
+    for symbol in universe.symbols:
+        if symbol in complete:
+            frames = prepare_frames(refresh.data[symbol], engine.params.indicators)
+            results.append(engine.evaluate(symbol, frames, market))
+    ranked = rank_signals(results)
+    breaker = "AKTIF" if market.circuit_breaker_active else "tidak aktif"
+    print(f"[SCAN] {len(universe.symbols)} coin | Regime BTC: {market.label} | Circuit breaker: {breaker}")
+    if refresh.errors:
+        failed = sorted({symbol for symbol, _ in refresh.errors})
+        print(f"Data gagal diambil untuk {len(failed)} coin: {', '.join(failed[:10])}")
+    print("Sinyal teratas:")
+    for rank, result in enumerate(ranked[:top], start=1):
+        print(f"  {rank:>2}. {format_signal(result)}")
+    entries = sum(1 for r in results if r.is_entry)
+    print(f"Entry valid: {entries} dari {len(results)} coin yang dianalisis (belum ada order, analisis saja)")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -152,6 +256,10 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
             return run_async(_with_client(settings, lambda c: run_universe(settings, c, args.refresh, args.top)))
         if args.command == "fetch":
             return run_async(_with_client(settings, lambda c: run_fetch(settings, c, args.symbol)))
+        if args.command == "analyze":
+            return run_async(_with_client(settings, lambda c: run_analyze(settings, c, args.symbol)))
+        if args.command == "scan":
+            return run_async(_with_client(settings, lambda c: run_scan(settings, c, args.top)))
     except ccxt.BaseError as exc:
         print(f"Gagal terhubung ke Binance: {exc}", file=sys.stderr)
         return 1

@@ -86,8 +86,17 @@ class Settings(BaseModel):
 
     # Data candle.
     timeframes: tuple[str, ...] = ("5m", "15m", "30m", "1h")
-    ohlcv_limit: int = Field(default=300, ge=50, le=1000)
+    # 1000 candle (batas satu request Binance) agar EMA 200 hampir identik
+    # dengan perhitungan pada riwayat penuh di backtest.
+    ohlcv_limit: int = Field(default=1000, ge=50, le=1000)
     candle_close_grace_ms: int = Field(default=2_000, ge=0, le=60_000)
+
+    # Sinyal confluence (Fase 2).
+    min_signal_score: float = Field(default=65.0, ge=0, le=100)
+    min_aligned_timeframes: int = Field(default=3, ge=1, le=4)
+    min_reward_risk: float = Field(default=1.5, ge=0.5, le=10)
+    circuit_breaker_drop: float = Field(default=0.03, gt=0, le=0.5)
+    circuit_breaker_hours: float = Field(default=2.0, gt=0, le=48)
 
     # Manajemen risiko (dipakai mulai Fase 3). Risiko per trade dibatasi
     # maksimal 2% modal sesuai aturan; nilai lebih kecil tetap diizinkan.
@@ -169,6 +178,16 @@ class Settings(BaseModel):
     @property
     def has_api_credentials(self) -> bool:
         return self.binance_api_key is not None and self.binance_api_secret is not None
+
+    @property
+    def db_path(self) -> Path:
+        """Database SQLite bot: bobot sinyal, jurnal trade, dan state posisi."""
+        return self.data_dir / "bot.db"
+
+    @property
+    def btc_symbol(self) -> str:
+        """Simbol acuan pasar (regime BTC dan circuit breaker)."""
+        return f"BTC/{self.quote_asset}"
 
     @property
     def universe_file(self) -> Path:

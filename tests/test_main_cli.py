@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+
+import ccxt
 from helpers import (
     T0,
     FakeClock,
@@ -86,7 +89,7 @@ async def test_run_fetch_mencetak_semua_timeframe(settings, mock_exchange, capsy
     assert await main.run_fetch(settings, client, "sol/usdt") == 0
     out = capsys.readouterr().out
     for timeframe in ("5m", "15m", "30m", "1h"):
-        assert f"  {timeframe:>4} |  300 candle" in out
+        assert f"  {timeframe:>4} |  999 candle" in out  # 1000 diminta, 1 candle berjalan dibuang
 
 
 async def test_run_fetch_simbol_tidak_ada(settings, mock_exchange, capsys):
@@ -94,3 +97,64 @@ async def test_run_fetch_simbol_tidak_ada(settings, mock_exchange, capsys):
     client = ExchangeClient(settings, mock_exchange, jitter=0)
     assert await main.run_fetch(settings, client, "XYZ/USDT") == 1
     assert "tidak ditemukan" in capsys.readouterr().err
+
+
+def kline_client(settings, mock_exchange, symbols):
+    """Client dengan mock exchange yang melayani candle deterministik untuk `symbols`."""
+    clock = FakeClock(T0 + 5_000)
+    server = FakeKlineServer(clock)
+    install_markets(mock_exchange, {s: make_market(s.split("/")[0]) for s in symbols})
+    mock_exchange.fetch_ohlcv.side_effect = server.fetch_ohlcv
+    mock_exchange.fetch_time.return_value = clock()
+    mock_exchange.fetch.return_value = {"data": []}
+    mock_exchange.fetch_tickers.return_value = {
+        symbol: make_ticker(symbol, 1e9 - i * 1e7) for i, symbol in enumerate(symbols)
+    }
+    return ExchangeClient(settings, mock_exchange, jitter=0, wall_clock_ms=clock)
+
+
+async def test_run_analyze_mencetak_laporan_lengkap(settings, mock_exchange, capsys):
+    client = kline_client(settings, mock_exchange, ["SOL/USDT", "BTC/USDT"])
+    assert await main.run_analyze(settings, client, "sol/usdt") == 0
+    out = capsys.readouterr().out
+    assert out.startswith("SOL/USDT | skor")
+    for text in ("Regime BTC:", "Alasan utama:", "1h (trend)", "30m (structure)", "15m (setup)", "5m (trigger)", "Rencana: entry"):
+        assert text in out
+    assert settings.db_path.exists()  # bobot dibaca dari database SQLite
+
+
+async def test_run_analyze_simbol_tidak_ada(settings, mock_exchange, capsys):
+    client = kline_client(settings, mock_exchange, ["SOL/USDT", "BTC/USDT"])
+    assert await main.run_analyze(settings, client, "XYZ/USDT") == 1
+    assert "tidak ditemukan" in capsys.readouterr().err
+
+
+async def test_run_scan_menampilkan_sinyal_teratas(settings, mock_exchange, capsys):
+    symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT", "AVAX/USDT"]
+    client = kline_client(settings, mock_exchange, symbols)
+    assert await main.run_scan(settings, client, top=3) == 0
+    out = capsys.readouterr().out
+    assert "[SCAN] 5 coin | Regime BTC:" in out
+    assert "Sinyal teratas:" in out
+    ranked_lines = [line for line in out.splitlines() if re.match(r"^\s+\d+\. ", line)]
+    assert len(ranked_lines) == 3
+    assert all(" skor " in line for line in ranked_lines)
+    assert "dari 5 coin yang dianalisis" in out
+
+
+async def test_run_scan_tetap_jalan_tanpa_data_btc(settings, mock_exchange, capsys):
+    symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    client = kline_client(settings, mock_exchange, symbols)
+    server_fetch = mock_exchange.fetch_ohlcv.side_effect
+
+    async def fail_btc(symbol, *args, **kwargs):
+        if symbol == "BTC/USDT":
+            raise ccxt.BadSymbol("binance simulasi data BTC gagal")
+        return await server_fetch(symbol, *args, **kwargs)
+
+    mock_exchange.fetch_ohlcv.side_effect = fail_btc
+    assert await main.run_scan(settings, client, top=5) == 0
+    captured = capsys.readouterr()
+    assert "regime BTC dan circuit breaker tidak diketahui" in captured.err
+    assert "Regime BTC: tidak diketahui" in captured.out
+    assert "dari 2 coin yang dianalisis" in captured.out

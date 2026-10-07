@@ -133,8 +133,8 @@ class DataFeed:
     ) -> None:
         for timeframe in timeframes:
             timeframe_to_ms(timeframe)
-        if not 1 <= limit <= BINANCE_MAX_KLINES - 2:
-            raise ValueError(f"limit harus antara 1 dan {BINANCE_MAX_KLINES - 2}")
+        if not 1 <= limit <= BINANCE_MAX_KLINES:
+            raise ValueError(f"limit harus antara 1 dan {BINANCE_MAX_KLINES}")
         self.client = client
         self.timeframes = tuple(timeframes)
         self.limit = limit
@@ -217,8 +217,9 @@ class DataFeed:
             return frame
 
     async def _fetch_full(self, symbol: str, timeframe: str, now: int) -> pd.DataFrame:
-        # +2: satu candle berjalan dan satu candle yang mungkin masih dalam masa grace.
-        rows = await self.client.fetch_ohlcv(symbol, timeframe, limit=self.limit + 2)
+        # +2: satu candle berjalan dan satu candle yang mungkin masih dalam masa grace
+        # (dibatasi 1000, batas satu request Binance).
+        rows = await self.client.fetch_ohlcv(symbol, timeframe, limit=min(self.limit + 2, BINANCE_MAX_KLINES))
         self.stats.api_calls += 1
         frame = drop_unclosed(ohlcv_to_frame(rows), timeframe_to_ms(timeframe), now, self.grace_ms)
         return frame.iloc[-self.limit :]
