@@ -279,6 +279,25 @@ async def test_backtest_penuh_konsisten(market, tmp_path):
     assert report.segment_a.trades + report.segment_b.trades == len(result.trades)
 
 
+async def test_cek_cepat_entry_tidak_mengubah_hasil(market, tmp_path):
+    settings = make_settings(tmp_path)
+    symbols = ["AAA/USDT", "BBB/USDT", "BTC/USDT"]
+    rules = {s: sol_rules(symbol=s, base=s.split("/")[0], step_size=1e-3, tick_size=1e-8) for s in symbols}
+    start, end = _window_period(market)
+    config = BacktestConfig(start=start, end=end, initial_capital=300.0, universe_size=3, min_quote_volume=1e6)
+
+    async def run(fast):
+        bt = Backtester(settings.model_copy(update={"max_open_positions": 1}), config, source=MemorySource(market),
+                        rules=rules, symbols=symbols, fast_entry_checks=fast)
+        return await bt.run()
+
+    fast, slow = await run(True), await run(False)
+    key = [(t.symbol, t.opened_at, t.closed_at, t.realized_pnl) for t in fast.trades]
+    assert key and key == [(t.symbol, t.opened_at, t.closed_at, t.realized_pnl) for t in slow.trades]
+    assert fast.equity.equals(slow.equity)
+    assert fast.entry_stats.skipped["slot posisi sudah penuh"] > 0  # cek cepat memang terpakai
+
+
 # ----------------------------------------------------------------------
 # Laporan
 # ----------------------------------------------------------------------

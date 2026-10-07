@@ -350,10 +350,15 @@ Pengaman tanpa look ahead (semuanya diuji):
 * universe hari D hanya memakai volume hari D-1.
 
 Agar 75 coin x 52.000 candle 5m tetap cepat, engine punya **penolakan cepat**:
-jika tren 1h, circuit breaker, atau timeframe 1h/30m/15m sudah PASTI menolak entry
-(termasuk batas atas skor yang masih mungkin), analisis 5m dilewati. Keputusan
-entry dijamin identik dengan evaluasi penuh (diuji pada ribuan candle acak). Di 4
-core, 6 bulan x 75 coin butuh sekitar 15 sampai 20 menit.
+jika tren 1h, circuit breaker, timeframe 1h/30m/15m, atau ruang ke resistance sudah
+PASTI menolak entry (termasuk batas atas skor yang masih mungkin), analisis 5m
+dilewati. Keputusan entry dijamin identik dengan evaluasi penuh (diuji pada ribuan
+candle acak). Simulasi juga mengecek slot penuh lebih dulu sebelum risk manager,
+dengan hasil yang identik (diuji).
+
+Ukuran kerja (diukur pada 89 kandidat x 182 hari, sekitar 3,9 juta evaluasi sinyal,
+4 core): sekitar 15 menit, RAM sekitar 1,1 GB untuk proses utama ditambah sekitar
+0,5 GB per proses paralel. Kurangi `--workers` jika RAM terbatas.
 
 ### Biaya dan dust
 

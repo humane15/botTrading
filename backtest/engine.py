@@ -133,6 +133,11 @@ class SymbolSeries:
         last = int(rows.max()) + 1 if exists.any() else 0
         ohlc = frame_5m[["open", "high", "low", "close"]].to_numpy(dtype="float64")[first:last]
         self.open, self.high, self.low, self.close = (ohlc[:, j].copy() for j in range(4))
+        # Harga penutupan terakhir yang sudah diketahui di tiap langkah (untuk menilai saldo coin).
+        step_close = np.where(self.row >= 0, self.close[np.maximum(self.row, 0)] if len(self.close) else np.nan, np.nan)
+        filled = np.where(np.isnan(step_close), 0, np.arange(len(step_close)))
+        np.maximum.accumulate(filled, out=filled)
+        self.close_ffill = step_close[filled] if len(step_close) else step_close
 
         setup = raw[setup_tf]
         atr = compute_indicators(setup, params.indicators)["atr"].to_numpy(dtype="float64") if len(setup) else np.empty(0)
@@ -188,6 +193,7 @@ class Backtester:
         weights: Mapping[str, float] | None = None,
         params: EngineParams | None = None,
         progress: Callable[[str], None] | None = None,
+        fast_entry_checks: bool = True,
     ) -> None:
         self.settings = settings
         self.config = config
@@ -198,6 +204,9 @@ class Backtester:
         self.params = params or EngineParams.from_settings(settings)
         self.progress = progress or (lambda text: None)
         self._now_ms = 0
+        # Cek murah sebelum risk manager (slot penuh, coin sudah punya posisi). Hasilnya identik
+        # dengan tanpa cek ini (diuji); opsi ini hanya untuk membuktikan hal itu.
+        self.fast_entry_checks = fast_entry_checks
 
     # ------------------------------------------------------------------
     def _now(self) -> datetime:
@@ -269,6 +278,19 @@ class Backtester:
         result.timings = timings
         return result
 
+    def _mark_to_market(self, executor: PaperExecutor, series: Mapping[str, SymbolSeries], i: int) -> float:
+        """Nilai akun: USDT + setiap saldo coin x harga penutupan terakhir yang diketahui pada langkah i."""
+        quote = self.settings.quote_asset
+        total = executor.free.get(quote, 0.0) + executor.locked.get(quote, 0.0)
+        for asset, qty in _asset_values(executor, quote).items():
+            symbol = f"{asset}/{quote}"
+            data = series.get(symbol)
+            price = float(data.close_ffill[i]) if data is not None else float("nan")
+            if price != price:  # belum ada candle: pakai harga terakhir di bursa simulasi
+                price = executor.prices.get(symbol, (0.0, 0.0))[0]
+            total += qty * price
+        return total
+
     # ------------------------------------------------------------------
     async def _simulate(
         self, steps: np.ndarray, series: Mapping[str, SymbolSeries], btc: SymbolSeries, per_symbol: Mapping[str, SymbolSignals]
@@ -324,16 +346,18 @@ class Backtester:
             day = self._now_ms // DAY_MS
             if day != current_day:
                 current_day = day
-                risk.loss_status(executor.equity())
+                # Ukuran ekuitas sama dengan yang dipakai risk manager saat entry (USDT + posisi bot),
+                # supaya batas rugi tidak terpengaruh nilai dust.
+                risk.loss_status(await manager.equity(settings.quote_asset))
 
             # c. Entry: sinyal candle ini, skor tertinggi dulu.
             for signal in rank_signals(by_step.get(i, [])):
                 # Penolakan yang pasti (sama dengan risk manager) dicek murah lebih dulu:
                 # slot maksimal sudah terisi, atau coin ini sudah punya posisi.
-                if len(open_positions) >= settings.max_open_positions:
+                if self.fast_entry_checks and len(open_positions) >= settings.max_open_positions:
                     stats.skipped[REASON_TEXT["posisi_penuh"]] += 1
                     continue
-                if any(p.symbol == signal.symbol for p in open_positions.values()):
+                if self.fast_entry_checks and any(p.symbol == signal.symbol for p in open_positions.values()):
                     stats.skipped[REASON_TEXT["sudah_ada_posisi"]] += 1
                     continue
                 price = series[signal.symbol].last_close(i)
@@ -351,18 +375,17 @@ class Backtester:
                 else:
                     stats.skipped[attempt.reason or "tidak terbuka"] += 1
 
-            # d. Kurva ekuitas.
-            equity[i] = executor.equity()
+            # d. Kurva ekuitas: semua saldo dinilai dengan harga penutupan candle langkah ini.
+            equity[i] = self._mark_to_market(executor, series, i)
             open_count[i] = len(open_positions)
             if i % report_every == 0 and i:
                 self.progress(f"  simulasi {i / len(steps):.0%} | ekuitas ${equity[i]:,.2f} | posisi {len(open_positions)}")
 
         for position in list(open_positions.values()):
             await manager.close_position(position, "akhir_backtest")
-        final_equity = executor.equity()
-        if len(steps):
-            equity[-1] = final_equity
         quote = settings.quote_asset
+        final_equity = self._mark_to_market(executor, series, len(steps) - 1)
+        equity[-1] = final_equity
         dust_value = final_equity - executor.free.get(quote, 0.0) - executor.locked.get(quote, 0.0)
 
         index = pd.DatetimeIndex(pd.to_datetime(steps, unit="ms", utc=True), name="timestamp")
@@ -392,6 +415,15 @@ class Backtester:
             timings={},
             database=store.conn,
         )
+
+
+def _asset_values(executor: PaperExecutor, quote: str) -> dict[str, float]:
+    assets: dict[str, float] = {}
+    for book in (executor.free, executor.locked):
+        for asset, amount in book.items():
+            if asset != quote and amount > 0:
+                assets[asset] = assets.get(asset, 0.0) + amount
+    return assets
 
 
 def _settings_snapshot(settings: Settings) -> dict[str, object]:
