@@ -16,7 +16,7 @@ dan belajar dari jurnal trade-nya sendiri.
 | --- | --- | --- |
 | 1 | Fondasi: config `.env`, koneksi exchange + retry, pemilihan 75 coin, data feed multi timeframe + cache | **Selesai** |
 | 2 | Analisis: indikator, S&R, Fibonacci, regime, confluence engine | **Selesai** |
-| 3 | Risiko dan order: sizing, risk manager, state recovery, partial fill | Belum |
+| 3 | Risiko dan order: sizing, risk manager, state recovery, partial fill | **Selesai** |
 | 4 | Backtest event driven + laporan | Belum |
 | 5 | Learning: jurnal, mistake analyzer, pattern memory, model ML | Belum |
 | 6 | Paper trading: loop utama, logging, notifikasi Telegram | Belum |
@@ -61,6 +61,7 @@ python main.py universe --top 10      # tampilkan 10 teratas saja
 python main.py fetch SOL/USDT         # ambil candle 5m, 15m, 30m, 1h dan tampilkan ringkasan
 python main.py analyze SOL/USDT       # analisis lengkap satu coin: skor, alasan, regime, rencana SL/TP
 python main.py scan --top 10          # analisis semua coin universe, tampilkan sinyal teratas
+python main.py positions              # posisi aktif dan 10 posisi tertutup terakhir (dari database)
 python main.py backtest               # Fase 4
 python main.py train                  # Fase 5
 python main.py report                 # Fase 4 dan 5
@@ -168,6 +169,124 @@ candle), ATR 14 (+ persentil), ADX 14 (+DI/-DI), OBV, dan rasio volume.
 * Analisis 1h/30m/15m disimpan di cache dan baru dihitung ulang saat candle
   timeframe itu berganti (hasil identik, diuji), sehingga scan dan backtest cepat.
 
+## Cara Kerja Fase 3 (Risiko dan Order)
+
+Fase ini berisi semua yang terjadi setelah sinyal entry muncul: menghitung
+ukuran posisi, memeriksa batas risiko, mengirim order, menjaga posisi sampai
+ditutup, dan memulihkan keadaan setelah bot restart. Order sungguhan baru
+dikirim di Fase 7; sampai saat itu semua dijalankan dengan simulasi bursa.
+
+### Ukuran posisi (`risk/position_sizing.py`)
+
+* Risiko per trade 1% modal (`RISK_PER_TRADE`, maksimal 2%). Jumlah coin =
+  risiko dibagi rugi per coin jika stop loss tersentuh.
+* Rugi per coin sudah termasuk fee 0.1% saat beli dan jual serta slippage,
+  sehingga rugi nyata di stop tidak melebihi 1% modal (kecuali harga gap
+  melewati stop).
+* Ukuran juga dibatasi porsi satu slot (modal dibagi jumlah slot) dan saldo
+  USDT bebas. Batas terkecil yang dipakai, dan alasannya dicatat.
+* Dibulatkan ke bawah sesuai step size Binance memakai `Decimal`.
+* Bagian TP1 dan bagian sisa (runner) masing masing harus tetap di atas min
+  notional Binance x 1.1. Jika tidak, entry ditolak sebelum order dikirim.
+* Slot posisi berkurang otomatis saat modal kecil: maksimal 5, atau modal dibagi
+  (2 x min notional x 1.1) jika lebih kecil. Contoh: modal $30 hanya 2 slot,
+  modal $10 tidak bisa entry.
+* Anti martingale: pengali ukuran hanya bisa mengecilkan posisi (regime
+  volatilitas tinggi x0.5), tidak pernah membesarkan. Setelah rugi, modal turun
+  sehingga ukuran posisi ikut mengecil.
+
+### Risk manager (`risk/risk_manager.py`)
+
+Entry baru ditolak jika:
+
+* file `STOP` ada di root proyek (kill switch);
+* rugi hari ini mencapai 5% atau rugi minggu ini mencapai 10% dari nilai akun
+  di awal hari atau minggu (UTC, posisi terbuka ikut dihitung). Entry dibuka
+  lagi otomatis di periode berikutnya;
+* slot posisi penuh atau modal terlalu kecil;
+* coin itu sudah punya posisi, atau ada saldo coin itu di luar kendali bot;
+* sudah ada 2 posisi pada coin yang korelasi return 1h terhadap BTC (7 hari
+  terakhir) minimal 0.8, dan coin baru juga berkorelasi tinggi.
+
+Posisi yang sudah terbuka tidak ditutup paksa: stop loss, TP, dan trailing
+stop tetap bekerja.
+
+```bash
+touch STOP     # kill switch: hentikan entry baru (Windows: type nul > STOP)
+rm STOP        # lanjutkan entry
+```
+
+### Siklus posisi (`risk/position_manager.py`)
+
+1. **Entry**: order LIMIT IOC dengan harga paling mahal ask + 0.3%
+   (`ENTRY_MAX_SLIPPAGE`). Bagian yang tidak terisi langsung batal, jadi tidak
+   ada order beli yang menggantung. Client order id dicatat ke database
+   **sebelum** order dikirim, sehingga order tetap bisa dilacak walau bot mati
+   tepat setelah mengirim.
+2. **Partial fill**: ukuran posisi, stop, dan TP dihitung dari jumlah yang
+   benar benar terisi dikurangi fee (fee beli Binance dipotong dalam coin).
+3. **Proteksi di bursa**: 50% posisi memakai OCO (TP1 berupa LIMIT_MAKER +
+   STOP_LOSS market), 50% sisanya memakai STOP_LOSS market. Stop loss selalu
+   ada di Binance, jadi posisi tetap terlindungi walau bot mati. Pair tanpa OCO:
+   TP1 dipantau bot dan stop tetap di bursa. Pair tanpa STOP_LOSS market:
+   memakai STOP_LOSS_LIMIT dengan batas harga 1% di bawah stop.
+4. **TP1**: resistance terdekat (minimal 1.5R). Setelah terisi, stop sisa posisi
+   pindah ke breakeven, yaitu harga entry ditambah fee beli dan jual.
+5. **Trailing stop**: harga tertinggi dikurangi 2 x ATR 15m. Stop hanya naik
+   (minimal 0.25 ATR per langkah agar hemat request) dan tidak pernah turun.
+   Jika stop baru sudah di atas harga, sisa posisi langsung dijual market.
+6. **Exit**: stop loss, breakeven, trailing stop, atau manual. PnL dan R multiple
+   dicatat lengkap dengan fee.
+
+Setiap sinkronisasi memeriksa ulang proteksi di bursa:
+
+* stop yang hilang (misalnya dibatalkan manual di aplikasi) dipasang lagi;
+* jika OCO dibatalkan manual, TP1 dipantau bot dan dijual market saat tersentuh;
+* coin yang terkunci order lain **tidak** dianggap terjual. Order bot yang tidak
+  tercatat (misalnya hasil kirimnya tidak pasti saat jaringan putus) dibatalkan
+  lalu diganti stop baru, sedangkan order manual Anda tidak disentuh dan
+  dilaporkan sebagai peringatan.
+
+### Eksekusi order (`core/orders.py`)
+
+* Filter Binance dibaca langsung (`LOT_SIZE`, `PRICE_FILTER`, `NOTIONAL` atau
+  `MIN_NOTIONAL`). Jumlah dibulatkan ke bawah, harga TP ke atas, harga stop ke
+  bawah, semuanya memakai `Decimal`.
+* Order **tidak pernah dikirim ulang** saat timeout: bot mencari order itu
+  berdasarkan client order id dulu, sehingga tidak ada order ganda.
+* `LiveExecutor` menolak berjalan tanpa konfirmasi mode live.
+
+### Simulasi bursa (`core/paper_exchange.py`)
+
+Saldo virtual untuk paper trading dan backtest. Logika posisi di paper,
+backtest, dan live adalah kode yang sama; hanya pelaksana ordernya yang
+berbeda. Simulasi sengaja dibuat pesimis:
+
+* entry terisi di ask + slippage, fee beli dipotong dari coin, fee jual dari USDT;
+* jika TP dan stop tersentuh dalam satu candle, dianggap stop yang terisi dulu;
+* jika harga dibuka gap di bawah stop, order terisi di harga open (rugi bisa
+  lebih dari 1R);
+* TP LIMIT_MAKER baru terisi jika harga melewati TP, bukan sekadar menyentuh.
+
+### State recovery (`risk/state_recovery.py`)
+
+Saat bot start, sebelum scan pertama, isi database dicocokkan dengan Binance:
+
+* order entry yang terkirim sebelum bot mati diselesaikan: jika terisi,
+  posisi dilanjutkan dan diberi proteksi; jika tidak ditemukan, ditandai gagal;
+* TP1 atau stop yang terisi saat bot mati dicatat, dan stop dipindah ke
+  breakeven jika TP1 sudah terisi;
+* stop yang hilang dipasang ulang;
+* coin yang dijual di luar bot dicatat sebagai `ditutup_di_luar_bot`;
+* saldo coin di luar bot dilaporkan dan coin itu diblokir dari entry;
+* order bot lama yang tidak terhubung ke posisi aktif dibatalkan.
+
+### Database posisi (`risk/positions.py`)
+
+Tabel `positions` (status, entry, stop, TP, PnL, snapshot sinyal dan fitur untuk
+jurnal Fase 5), `orders` (audit semua order), dan `equity_snapshots` (nilai akun
+di awal hari dan minggu). Lihat isinya dengan `python main.py positions`.
+
 ## Struktur Proyek
 
 ```
@@ -181,7 +300,9 @@ candle), ATR 14 (+ persentil), ADX 14 (+DI/-DI), OBV, dan rasio volume.
 │   ├── exchange.py          # ccxt async, semaphore, retry, backoff 429, cek izin API key
 │   ├── data_feed.py         # OHLCV multi timeframe + cache candle tertutup
 │   ├── universe.py          # pemilihan 75 coin dinamis
-│   └── database.py          # koneksi SQLite (data/bot.db)
+│   ├── database.py          # koneksi SQLite (data/bot.db)
+│   ├── orders.py            # filter Binance, client order id, LiveExecutor (IOC, stop, OCO)
+│   └── paper_exchange.py    # simulasi bursa untuk paper trading dan backtest
 ├── analysis/
 │   ├── indicators.py        # EMA, RSI, MACD, BB, ATR, ADX, OBV (pandas/numpy, cocok TA-Lib)
 │   ├── pivots.py            # swing high/low
@@ -196,7 +317,12 @@ candle), ATR 14 (+ persentil), ADX 14 (+DI/-DI), OBV, dan rasio volume.
 │   ├── weights.py           # bobot sinyal di SQLite
 │   └── confluence.py        # skor 0..100 multi timeframe + gerbang entry
 ├── learning/                # Fase 5
-├── risk/                    # Fase 3
+├── risk/
+│   ├── position_sizing.py   # ukuran posisi dari jarak stop (fee + slippage)
+│   ├── risk_manager.py      # kill switch, batas rugi, slot, korelasi BTC
+│   ├── positions.py         # posisi, order, snapshot ekuitas di SQLite
+│   ├── position_manager.py  # entry, OCO, TP1, breakeven, trailing, exit
+│   └── state_recovery.py    # pencocokan database dengan Binance saat start
 ├── backtest/                # Fase 4
 ├── main.py                  # CLI
 ├── tests/                   # unit test (semua respons Binance di-mock)

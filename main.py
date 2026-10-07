@@ -6,6 +6,7 @@ Contoh pemakaian:
     python main.py fetch SOL/USDT        ambil candle 5m, 15m, 30m, 1h
     python main.py analyze SOL/USDT      analisis lengkap satu coin (skor, alasan, rencana)
     python main.py scan --top 10         analisis semua coin universe, tampilkan sinyal teratas
+    python main.py positions             posisi aktif dan riwayat posisi (dari database)
     python main.py backtest              backtest (Fase 4)
     python main.py train                 latih model ML (Fase 5)
     python main.py report                laporan performa (Fase 4 dan 5)
@@ -48,6 +49,7 @@ from config.settings import (
 from core.data_feed import DataFeed
 from core.exchange import ExchangeClient
 from core.universe import UniverseSelector
+from risk.positions import DUST, PENDING, Position, PositionStore
 
 T = TypeVar("T")
 
@@ -72,6 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_scan = sub.add_parser("scan", help="analisis semua coin universe dan tampilkan sinyal teratas")
     p_scan.add_argument("--top", type=int, default=10, help="jumlah sinyal yang ditampilkan (default 10)")
+
+    p_positions = sub.add_parser("positions", help="posisi aktif dan riwayat posisi dari database")
+    p_positions.add_argument("--limit", type=int, default=10, help="jumlah posisi tertutup terakhir yang ditampilkan (default 10)")
 
     sub.add_parser("backtest", help="jalankan backtest (Fase 4)")
     sub.add_parser("report", help="laporan performa (Fase 4 dan 5)")
@@ -230,6 +235,66 @@ async def run_scan(settings: Settings, client: ExchangeClient, top: int = 10) ->
     return 0
 
 
+def _short_time(iso: str | None) -> str:
+    return f"{datetime.fromisoformat(iso):%Y-%m-%d %H:%M} UTC" if iso else "tidak tercatat"
+
+
+def _format_active(position: Position) -> str:
+    if position.status == PENDING:
+        return f"#{position.id} {position.symbol} | menunggu hasil order entry (dicek ulang saat bot start)"
+    stop_kind = "stop breakeven/trailing" if position.breakeven else "stop loss"
+    return (
+        f"#{position.id} {position.symbol} | {position.status} | entry {position.entry_price:.8g} | "
+        f"sisa {position.qty:.8g} dari {position.initial_qty:.8g} | {stop_kind} {position.stop_price:.8g} | "
+        f"TP1 {position.tp1_price:.8g} | dibuka {_short_time(position.opened_at)}"
+    )
+
+
+def _format_closed(position: Position, quote: str) -> str:
+    return (
+        f"#{position.id} {position.symbol} | PnL {position.realized_pnl:+.2f} {quote} ({position.r_multiple:+.2f}R) | "
+        f"{position.exit_reason} | ditutup {_short_time(position.closed_at)}"
+    )
+
+
+def run_positions(settings: Settings, limit: int = 10) -> int:
+    """Posisi aktif dan riwayat posisi dari database, tanpa koneksi ke Binance."""
+    store = PositionStore.open(settings.db_path)
+    try:
+        mode = settings.trading_mode
+        active = store.active(mode)
+        stuck = store.with_status([DUST], mode)
+        closed = store.closed(mode)
+    finally:
+        store.conn.close()
+    quote = settings.quote_asset
+    label = "paper (saldo virtual)" if mode == "paper" else "live (uang sungguhan)"
+    kill = "AKTIF, tidak ada entry baru (hapus file STOP untuk melanjutkan)" if settings.kill_switch_file.exists() else "tidak aktif"
+    print(f"Posisi mode {label} | database {settings.db_path}")
+    print(f"Kill switch: {kill}")
+    print(f"Posisi aktif ({len(active)}):" if active else "Posisi aktif: tidak ada")
+    for position in active:
+        print(f"  {_format_active(position)}")
+    if stuck:
+        print(f"Perlu dicek manual ({len(stuck)}):")
+        for position in stuck:
+            print(f"  #{position.id} {position.symbol} | sisa {position.qty:.8g} {position.base} | {position.exit_reason}")
+    if not closed:
+        print("Belum ada posisi tertutup")
+        return 0
+    shown = closed[: max(limit, 0)]
+    print(f"Posisi tertutup terakhir ({len(shown)} dari {len(closed)}):")
+    for position in shown:
+        print(f"  {_format_closed(position, quote)}")
+    wins = sum(1 for p in closed if p.realized_pnl > 0)
+    total = sum(p.realized_pnl for p in closed)
+    print(
+        f"Ringkasan {len(closed)} posisi tertutup: menang {wins}, kalah {len(closed) - wins}, "
+        f"win rate {wins / len(closed):.1%}, total PnL {total:+.2f} {quote}"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -251,6 +316,8 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
         return 2
 
     settings.ensure_dirs()
+    if args.command == "positions":
+        return run_positions(settings, args.limit)
     try:
         if args.command == "universe":
             return run_async(_with_client(settings, lambda c: run_universe(settings, c, args.refresh, args.top)))

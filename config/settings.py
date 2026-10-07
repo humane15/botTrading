@@ -108,6 +108,15 @@ class Settings(BaseModel):
     slippage_rate: float = Field(default=0.0005, ge=0, le=0.05)
     paper_start_balance: float = Field(default=100.0, gt=0)
 
+    # Eksekusi dan pengelolaan posisi (Fase 3).
+    tp1_fraction: float = Field(default=0.5, gt=0, le=1.0)            # porsi dijual di target 1
+    trailing_atr_mult: float = Field(default=2.0, gt=0, le=10)        # jarak trailing stop = 2 x ATR 15m
+    entry_max_slippage: float = Field(default=0.003, ge=0, le=0.05)  # batas harga entry IOC: ask + 0.3%
+    stop_limit_buffer: float = Field(default=0.01, gt=0, le=0.1)      # hanya untuk pair tanpa STOP_LOSS market
+    min_notional_buffer: float = Field(default=1.1, ge=1.0, le=3.0)   # cadangan di atas min notional Binance
+    btc_correlation_threshold: float = Field(default=0.8, ge=0, le=1)
+    max_btc_correlated_positions: int = Field(default=2, ge=1, le=20)
+
     # Notifikasi Telegram (opsional).
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None
@@ -178,6 +187,11 @@ class Settings(BaseModel):
     @property
     def has_api_credentials(self) -> bool:
         return self.binance_api_key is not None and self.binance_api_secret is not None
+
+    @property
+    def kill_switch_file(self) -> Path:
+        """File STOP di root proyek: jika ada, bot berhenti membuka posisi baru."""
+        return PROJECT_ROOT / "STOP"
 
     @property
     def db_path(self) -> Path:

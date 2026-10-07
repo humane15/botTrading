@@ -1,4 +1,4 @@
-"""Test CLI main.py: gerbang mode live, perintah yang belum tersedia, dan perintah Fase 1."""
+"""Test CLI main.py: gerbang mode live, perintah yang belum tersedia, perintah Fase 1 sampai 3."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from helpers import (
 
 import main
 from core.exchange import ExchangeClient
+from risk.positions import CLOSED, DUST, OPEN, Position, PositionStore
 
 FAKE_KEYS = {"BINANCE_API_KEY": "kunci-palsu-123", "BINANCE_API_SECRET": "rahasia-palsu-456"}
 
@@ -158,3 +159,31 @@ async def test_run_scan_tetap_jalan_tanpa_data_btc(settings, mock_exchange, caps
     assert "regime BTC dan circuit breaker tidak diketahui" in captured.err
     assert "Regime BTC: tidak diketahui" in captured.out
     assert "dari 2 coin yang dianalisis" in captured.out
+
+
+def test_positions_menampilkan_isi_database(tmp_path, capsys):
+    store = PositionStore.open(tmp_path / "data" / "bot.db")
+    sol = store.insert(Position(symbol="SOL/USDT", mode="paper", status=OPEN, entry_price=100.05, initial_qty=1.998,
+                                qty=1.998, stop_price=98, tp1_price=104))
+    store.insert(Position(symbol="ETH/USDT", mode="paper", status=CLOSED, realized_pnl=10.42, risk_amount=4.6,
+                          exit_reason="trailing_stop", closed_at="2026-10-07T10:15:00+00:00"))
+    store.insert(Position(symbol="XRP/USDT", mode="paper", status=CLOSED, realized_pnl=-4.0, risk_amount=4.0,
+                          exit_reason="stop_loss", closed_at="2026-10-07T09:00:00+00:00"))
+    store.insert(Position(symbol="PEPE/USDT", mode="paper", status=DUST, qty=12.0, exit_reason="cek manual"))
+    store.insert(Position(symbol="BNB/USDT", mode="live", status=OPEN, qty=1.0))  # mode lain tidak ditampilkan
+    store.conn.close()
+
+    assert run_cli(tmp_path, ["positions", "--limit", "1"]) == 0
+    out = capsys.readouterr().out
+    assert f"#{sol.id} SOL/USDT | open | entry 100.05 | sisa 1.998 dari 1.998 | stop loss 98 | TP1 104" in out
+    assert "Perlu dicek manual (1)" in out and "PEPE/USDT | sisa 12 PEPE" in out
+    assert "ETH/USDT | PnL +10.42 USDT (+2.27R) | trailing_stop | ditutup 2026-10-07 10:15 UTC" in out
+    assert "XRP/USDT" not in out  # hanya 1 posisi tertutup terakhir yang ditampilkan
+    assert "menang 1, kalah 1, win rate 50.0%, total PnL +6.42 USDT" in out
+    assert "BNB/USDT" not in out
+
+
+def test_positions_database_kosong(tmp_path, capsys):
+    assert run_cli(tmp_path, ["positions"]) == 0
+    out = capsys.readouterr().out
+    assert "Posisi aktif: tidak ada" in out and "Belum ada posisi tertutup" in out

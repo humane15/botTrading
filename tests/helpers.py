@@ -25,7 +25,8 @@ def make_settings(tmp_path, **overrides: Any) -> Settings:
 ASYNC_METHODS = (
     "load_markets", "fetch_tickers", "fetch_ticker", "fetch_ohlcv", "fetch_time", "fetch_balance",
     "fetch", "close", "load_time_difference", "create_order", "sapi_get_spot_delist_schedule",
-    "sapi_get_account_apirestrictions",
+    "sapi_get_account_apirestrictions", "fetch_order", "cancel_order", "fetch_open_orders",
+    "private_post_orderlist_oco", "private_delete_orderlist",
 )
 
 
@@ -164,3 +165,51 @@ class FakeKlineServer:
             return [self.candle(symbol, tf_ms, t, forming=(t == current_open)) for t in range(start, end + 1, tf_ms)]
         finally:
             self.in_flight -= 1
+
+
+# ----------------------------------------------------------------------
+# Fase 3: aturan pair, sinyal, dan simulasi bursa
+# ----------------------------------------------------------------------
+def sol_rules(**overrides: Any):
+    from core.orders import SymbolRules
+
+    values = dict(symbol="SOL/USDT", base="SOL", quote="USDT", step_size=0.001, tick_size=0.01, min_qty=0.001, min_notional=5.0)
+    values.update(overrides)
+    return SymbolRules(**values)
+
+
+def make_signal(
+    symbol: str = "SOL/USDT",
+    entry: float = 100.0,
+    stop: float = 98.0,
+    tp1: float = 104.0,
+    atr: float = 1.0,
+    resistance: tuple[float, float] | None = None,
+    size_multiplier: float = 1.0,
+    rejections: tuple[str, ...] = (),
+):
+    """SignalResult minimal yang valid untuk menguji eksekusi dan manajemen posisi."""
+    import pandas as pd
+
+    from analysis.confluence import SignalResult, TradePlan
+    from analysis.regime import MarketContext, Regime
+    from analysis.support_resistance import Zone
+
+    zone = Zone(resistance[0], resistance[1], 3, 0.7, 0) if resistance else None
+    rr = (zone.low - entry) / (entry - stop) if zone else float("inf")
+    plan = TradePlan(entry=entry, stop=stop, tp1=tp1, targets=(entry * 1.1,), atr=atr, reward_risk=rr, resistance=zone)
+    regime = Regime("trending_up", size_multiplier < 1, 30.0, 0.95 if size_multiplier < 1 else 0.5, "uji", size_multiplier)
+    return SignalResult(
+        symbol=symbol, timestamp=pd.Timestamp("2025-01-01", tz="UTC"), score=75.0, raw_score=0.5, aligned=4,
+        timeframes={}, regime=regime, market=MarketContext(), plan=plan, reasons=("Pantulan Fib 61.8% 15m",),
+        pattern="fib_618", tags=("fib_618@15m",), conditions=("volume_lemah",), penalty=0.0, rejections=rejections,
+        features={"15m.score": 0.4, "rsi": 45.0},
+    )
+
+
+def paper_executor(balance: float = 1000.0, price: float = 100.0, **kwargs: Any):
+    from core.paper_exchange import PaperExecutor
+
+    executor = PaperExecutor({"SOL/USDT": sol_rules()}, starting_balance=balance, **kwargs)
+    executor.set_price("SOL/USDT", price)
+    return executor
