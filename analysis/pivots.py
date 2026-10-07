@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 
+from analysis.base import column_values
+
 
 @dataclass(frozen=True)
 class Pivot:
@@ -48,9 +50,9 @@ def find_pivots(
     if left < 1 or right < 1:
         raise ValueError("left dan right minimal 1")
     start = max(0, len(frame) - lookback) if lookback else 0
-    highs = frame["high"].to_numpy(dtype="float64")[start:]
-    lows = frame["low"].to_numpy(dtype="float64")[start:]
-    ratios = frame["volume_ratio"].to_numpy(dtype="float64")[start:] if "volume_ratio" in frame.columns else None
+    highs = column_values(frame, "high")[start:]
+    lows = column_values(frame, "low")[start:]
+    ratios = column_values(frame, "volume_ratio")[start:] if "volume_ratio" in frame.columns else None
 
     def build(positions: np.ndarray, prices: np.ndarray, kind: str) -> list[Pivot]:
         return [

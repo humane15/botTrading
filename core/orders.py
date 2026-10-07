@@ -27,7 +27,7 @@ import secrets
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 from typing import Any, Protocol
 
 import ccxt
@@ -52,10 +52,25 @@ def _dec(value: float | str) -> Decimal:
     return Decimal(str(value))
 
 
+_FLOAT_NOISE = Decimal("1e-12")
+
+
 def _round_to(value: float, step: float, rounding: str) -> float:
+    """Bulatkan ke kelipatan step. Derau float dianggap sudah tepat di kelipatan.
+
+    Contoh: 8.463 - 4.231 menghasilkan 4.231999999999999 di float; tanpa toleransi,
+    pembulatan ke bawah menjadi 4.231 dan satu step coin tidak ikut terjual.
+    Toleransinya relatif (1e-12 x jumlah step), jauh di bawah presisi saldo Binance
+    (8 desimal), jadi angka yang memang di bawah kelipatan tetap dibulatkan ke bawah.
+    """
     if step <= 0:
         return float(value)
-    units = (_dec(value) / _dec(step)).to_integral_value(rounding=rounding)
+    units = _dec(value) / _dec(step)
+    nearest = units.to_integral_value(rounding=ROUND_HALF_EVEN)
+    if abs(units - nearest) <= _FLOAT_NOISE * max(abs(units), Decimal(1)):
+        units = nearest
+    else:
+        units = units.to_integral_value(rounding=rounding)
     return float(units * _dec(step))
 
 

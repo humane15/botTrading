@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,8 +35,25 @@ DUST = "dust"
 ACTIVE_STATUSES = (PENDING, OPEN, TP1_HIT)
 
 
+# Jam yang dipakai untuk mencatat waktu posisi. Backtest memasang jam simulasi
+# lewat simulated_clock() sehingga opened_at/closed_at mengikuti waktu candle.
+_CLOCK: ContextVar[Callable[[], datetime] | None] = ContextVar("position_clock", default=None)
+
+
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    clock = _CLOCK.get()
+    now = clock() if clock is not None else datetime.now(timezone.utc)
+    return now.isoformat(timespec="seconds")
+
+
+@contextmanager
+def simulated_clock(clock: Callable[[], datetime]) -> Iterator[None]:
+    """Selama blok ini, semua waktu posisi, order, dan ekuitas dicatat memakai `clock`."""
+    token = _CLOCK.set(clock)
+    try:
+        yield
+    finally:
+        _CLOCK.reset(token)
 
 
 @dataclass
@@ -46,6 +65,7 @@ class Position:
     planned_qty: float = 0.0
     entry_price: float = 0.0       # harga rata rata terisi
     initial_qty: float = 0.0       # jumlah bersih setelah fee, yang bisa dijual
+    dust_qty: float = 0.0          # sisa coin di bawah step size yang tidak bisa dijual (tetap di akun)
     qty: float = 0.0               # sisa jumlah yang masih dipegang
     initial_stop: float = 0.0
     stop_price: float = 0.0
@@ -92,7 +112,10 @@ class Position:
 
     @property
     def cost_per_unit(self) -> float:
-        return self.cost_quote / self.initial_qty if self.initial_qty > 0 else 0.0
+        """Harga pokok per coin yang diterima. Dust ikut dibagi rata sehingga biayanya tidak
+        dibebankan ke PnL trade (dust tetap bernilai dan tetap ada di akun)."""
+        received = self.initial_qty + self.dust_qty
+        return self.cost_quote / received if received > 0 else 0.0
 
     def breakeven_price(self, fee_rate: float) -> float:
         """Harga jual agar sisa posisi tidak rugi (menutup fee beli dan fee jual)."""
@@ -266,6 +289,19 @@ class PositionStore:
             query += " LIMIT ?"
             params.append(limit)
         return [_from_row(row) for row in self.conn.execute(query, params)]
+
+    def dust_by_asset(self, mode: str | None = None) -> dict[str, float]:
+        """Total dust (sisa coin di bawah step size) yang ditinggalkan posisi bot, per coin."""
+        query = "SELECT symbol, SUM(dust_qty) AS dust FROM positions WHERE dust_qty > 0"
+        params: list[Any] = []
+        if mode is not None:
+            query += " AND mode = ?"
+            params.append(mode)
+        totals: dict[str, float] = {}
+        for row in self.conn.execute(query + " GROUP BY symbol", params):
+            base = str(row["symbol"]).split("/")[0]
+            totals[base] = totals.get(base, 0.0) + float(row["dust"] or 0.0)
+        return totals
 
     # ------------------------------------------------------------------
     # Order

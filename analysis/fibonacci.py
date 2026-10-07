@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from analysis.base import SignalScore, has_columns, is_valid, last, tail
+from analysis.base import SignalScore, column_values, has_columns, is_valid, last, tail
 from analysis.support_resistance import Zone
 
 FIB_RATIOS = (0.236, 0.382, 0.5, 0.618, 0.786)
@@ -70,8 +70,8 @@ def find_fib_leg(frame: pd.DataFrame, timeframe: str = "", params: FibParams = F
     if not is_valid(atr) or atr <= 0:
         return None
     start = max(0, len(frame) - params.lookback)
-    highs = frame["high"].to_numpy(dtype="float64")[start:]
-    lows = frame["low"].to_numpy(dtype="float64")[start:]
+    highs = column_values(frame, "high")[start:]
+    lows = column_values(frame, "low")[start:]
     high_rel = int(np.argmax(highs))
     if high_rel == 0 or (len(highs) - 1 - high_rel) < params.confirm_bars:
         return None  # puncak di awal jendela (tidak ada low sebelumnya) atau masih membuat high baru

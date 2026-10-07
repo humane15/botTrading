@@ -17,7 +17,7 @@ dan belajar dari jurnal trade-nya sendiri.
 | 1 | Fondasi: config `.env`, koneksi exchange + retry, pemilihan 75 coin, data feed multi timeframe + cache | **Selesai** |
 | 2 | Analisis: indikator, S&R, Fibonacci, regime, confluence engine | **Selesai** |
 | 3 | Risiko dan order: sizing, risk manager, state recovery, partial fill | **Selesai** |
-| 4 | Backtest event driven + laporan | Belum |
+| 4 | Backtest event driven + laporan | **Selesai** |
 | 5 | Learning: jurnal, mistake analyzer, pattern memory, model ML | Belum |
 | 6 | Paper trading: loop utama, logging, notifikasi Telegram | Belum |
 | 7 | Live (opsional, setelah paper trading 2 sampai 4 minggu positif) | Belum |
@@ -62,9 +62,11 @@ python main.py fetch SOL/USDT         # ambil candle 5m, 15m, 30m, 1h dan tampil
 python main.py analyze SOL/USDT       # analisis lengkap satu coin: skor, alasan, regime, rencana SL/TP
 python main.py scan --top 10          # analisis semua coin universe, tampilkan sinyal teratas
 python main.py positions              # posisi aktif dan 10 posisi tertutup terakhir (dari database)
-python main.py backtest               # Fase 4
+python main.py backtest               # backtest 6 bulan terakhir, universe 75 coin (unduh data otomatis)
+python main.py backtest --offline     # ulangi backtest dengan data yang sudah diunduh
+python main.py backtest --start 2026-01-01 --end 2026-07-01 --capital 1000
+python main.py report                 # tampilkan laporan backtest terakhir
 python main.py train                  # Fase 5
-python main.py report                 # Fase 4 dan 5
 python main.py paper                  # Fase 6
 python main.py live --confirm-live    # Fase 7
 ```
@@ -287,6 +289,101 @@ Tabel `positions` (status, entry, stop, TP, PnL, snapshot sinyal dan fitur untuk
 jurnal Fase 5), `orders` (audit semua order), dan `equity_snapshots` (nilai akun
 di awal hari dan minggu). Lihat isinya dengan `python main.py positions`.
 
+## Cara Kerja Fase 4 (Backtest)
+
+```bash
+python main.py backtest                       # 6 bulan terakhir, modal PAPER_START_BALANCE
+python main.py backtest --capital 1000        # modal awal lain
+python main.py backtest --months 3 --workers 2
+python main.py backtest --symbols SOL/USDT,ETH/USDT --offline
+python main.py report                         # baca ulang laporan terakhir
+```
+
+Opsi lain: `--start`/`--end` (tanggal UTC), `--candidates` (jumlah kandidat coin
+yang diunduh, default 1.4 x UNIVERSE_SIZE), dan `--oos-fraction` (porsi akhir
+periode untuk segmen B, default 1/3).
+
+### Data historis (`backtest/data.py`)
+
+* Candle 5m, 15m, 30m, dan 1h diunduh langsung dari Binance (bukan hasil resample),
+  ditambah 1000 candle pemanasan per timeframe sebelum tanggal mulai, sama dengan
+  jendela data bot live.
+* Disimpan di `data/history/` (file `.npz` per coin dan timeframe) beserta aturan
+  pair (step size, tick size, min notional). Unduhan berikutnya hanya mengambil
+  bagian yang belum ada, dan `--offline` menjalankan ulang tanpa koneksi.
+* Unduhan pertama 6 bulan untuk sekitar 105 kandidat butuh kira kira 9.000 request
+  (dibatasi semaphore dan backoff rate limit dari Fase 1) dan sekitar 400 MB disk.
+
+### Universe point in time (`backtest/universe.py`)
+
+Memakai daftar 75 coin HARI INI untuk menguji 6 bulan ke belakang akan membuat
+hasil terlalu bagus, karena coin yang sekarang ramai biasanya coin yang naik di
+periode itu. Karena itu kandidat diunduh lebih banyak, lalu setiap hari dipilih 75
+coin dari volume hari sebelumnya (minimal 5 juta USD), persis seperti bot live yang
+memperbarui universe tiap 24 jam.
+
+### Mesin backtest (`backtest/signals.py`, `backtest/engine.py`)
+
+1. **Sinyal**: `ConfluenceEngine` yang sama dengan live dievaluasi di setiap candle
+   5m tertutup, dengan jendela 1000 candle tertutup per timeframe. Indikator dihitung
+   sekali lalu diiris (aman karena semua indikator kausal), sedangkan pivot, zona S&R,
+   dan Fibonacci dihitung ulang dari jendela tiap langkah, persis seperti live.
+   Regime BTC dan circuit breaker dihitung berurutan dengan kode live. Sinyal tiap
+   coin tidak bergantung pada saldo, jadi dihitung paralel per coin (hasilnya
+   identik dengan 1 proses, diuji).
+2. **Simulasi portofolio (event driven)**, setiap candle 5m berurutan waktu:
+   bursa simulasi mengeksekusi stop/TP pada candle yang baru tertutup, lalu
+   `PositionManager` menjalankan TP1, breakeven, dan trailing stop; setelah itu sinyal
+   baru dicoba lewat `RiskManager` (slot, batas rugi harian/mingguan, korelasi BTC)
+   dan position sizing. Semua kode ini sama dengan mode live, dengan jam simulasi
+   (waktu candle) untuk batas rugi harian dan catatan waktu posisi.
+3. Entry terisi di harga penutupan candle sinyal + slippage; stop dan TP diperiksa
+   mulai candle berikutnya. Posisi yang masih terbuka di akhir periode ditutup di
+   harga terakhir.
+
+Pengaman tanpa look ahead (semuanya diuji):
+
+* jendela tiap timeframe hanya berisi candle yang sudah tertutup pada waktu keputusan;
+* data setelah waktu T diubah drastis, sinyal sampai T tetap sama persis;
+* sinyal backtest sama dengan evaluasi live yang menghitung indikator hanya dari
+  data sampai T;
+* universe hari D hanya memakai volume hari D-1.
+
+Agar 75 coin x 52.000 candle 5m tetap cepat, engine punya **penolakan cepat**:
+jika tren 1h, circuit breaker, atau timeframe 1h/30m/15m sudah PASTI menolak entry
+(termasuk batas atas skor yang masih mungkin), analisis 5m dilewati. Keputusan
+entry dijamin identik dengan evaluasi penuh (diuji pada ribuan candle acak). Di 4
+core, 6 bulan x 75 coin butuh sekitar 15 sampai 20 menit.
+
+### Biaya dan dust
+
+* Fee 0.1% per transaksi dan slippage 0.05% (bisa diatur di `.env`), min notional,
+  step size, dan tick size per pair, urutan pesimis stop sebelum TP, dan gap.
+* Fee beli Binance dipotong dalam coin, lalu jumlah yang bisa dijual dibulatkan ke
+  bawah sesuai step size. Sisanya (dust) tetap di akun. Dust dicatat terpisah
+  (`dust_qty`) sehingga PnL dan R hanya menghitung coin yang benar benar
+  diperdagangkan, dan state recovery tidak menganggap dust milik bot sebagai saldo
+  di luar bot.
+
+### Laporan (`backtest/report.py`)
+
+* Total return, CAGR, max drawdown dan lamanya, Sharpe dan Sortino (return harian x
+  akar 365), Calmar, win rate, profit factor, rata rata dan median R, t-stat rata
+  rata R, expectancy, exposure, total fee.
+* Rincian per alasan exit, regime, pola setup, dan coin, return bulanan, serta
+  pembanding buy and hold BTC.
+* Periode dibagi menjadi segmen A dan segmen B (1/3 terakhir). Parameter strategi
+  belum dioptimasi pada data ini, jadi seluruh periode adalah out of sample untuk
+  strategi dasar. Di Fase 5, modul learning hanya boleh belajar dari segmen A, dan
+  klaim performa memakai segmen B.
+* Hasil disimpan di `data/backtests/<waktu>/`: `report.txt`, `report.json`,
+  `trades.csv`, `equity.csv`, `events.log`, dan `journal.db` (jurnal trade untuk Fase 5).
+
+Bias yang masih tersisa dan perlu diingat saat membaca hasil: coin yang sudah
+delisting tidak bisa diunduh dari Binance, entry dianggap terisi di harga penutupan
+candle (bot live mengirim order beberapa detik setelahnya), dan likuiditas order
+book tidak disimulasikan (aman untuk modal kecil).
+
 ## Struktur Proyek
 
 ```
@@ -323,7 +420,12 @@ di awal hari dan minggu). Lihat isinya dengan `python main.py positions`.
 │   ├── positions.py         # posisi, order, snapshot ekuitas di SQLite
 │   ├── position_manager.py  # entry, OCO, TP1, breakeven, trailing, exit
 │   └── state_recovery.py    # pencocokan database dengan Binance saat start
-├── backtest/                # Fase 4
+├── backtest/
+│   ├── data.py              # unduh dan simpan data historis (data/history)
+│   ├── universe.py          # universe 75 coin point in time per hari
+│   ├── signals.py           # tahap 1: sinyal per coin, paralel, tanpa look ahead
+│   ├── engine.py            # tahap 2: simulasi portofolio event driven
+│   └── report.py            # metrik, rincian, pembanding, simpan hasil
 ├── main.py                  # CLI
 ├── tests/                   # unit test (semua respons Binance di-mock)
 └── README.md

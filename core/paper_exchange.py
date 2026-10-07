@@ -79,8 +79,6 @@ class Fill:
 
 
 class PaperExecutor:
-    mode = "paper"
-
     def __init__(
         self,
         rules: Mapping[str, SymbolRules] | None = None,
@@ -90,7 +88,9 @@ class PaperExecutor:
         fee_rate: float = 0.001,
         slippage: float = 0.0005,
         clock: Callable[[], int] | None = None,
+        mode: str = "paper",
     ) -> None:
+        self.mode = mode  # "paper" atau "backtest": label posisi di database
         self._rules: dict[str, SymbolRules] = dict(rules or {})
         self.quote = quote
         self.fee_rate = fee_rate

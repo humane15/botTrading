@@ -218,9 +218,13 @@ class PositionManager:
     async def _finalize_entry(self, position: Position, order: OrderResult, rules: SymbolRules) -> Position:
         if order.filled <= 0:
             return self._fail(position, "order entry tidak terisi")
-        net_qty = rules.qty_down(order.filled - order.fee_base)
+        received = max(order.filled - order.fee_base, 0.0)
+        net_qty = rules.qty_down(received)
         position.entry_price = order.average or order.price or 0.0
         position.initial_qty = position.qty = net_qty
+        # Sisa di bawah step size tidak bisa dijual (dust). Dicatat terpisah agar PnL dan R
+        # trade hanya menghitung coin yang benar benar diperdagangkan.
+        position.dust_qty = max(received - net_qty, 0.0)
         position.cost_quote = order.filled * position.entry_price + order.fee_quote
         # Fee beli yang dipotong dalam coin sudah tercermin di net_qty; di sini dicatat
         # nilai setaranya dalam USDT hanya untuk laporan.
@@ -228,7 +232,7 @@ class PositionManager:
         position.highest_price = position.lowest_price = position.entry_price
         position.opened_at = utc_now_iso()
         stop_exit = position.stop_price * (1 - self.config.slippage) * (1 - self.config.fee_rate)
-        position.risk_amount = max(position.cost_quote - net_qty * stop_exit, 0.0)
+        position.risk_amount = max(net_qty * (position.cost_per_unit - stop_exit), 0.0)
         if order.filled + rules.step_size / 2 < position.planned_qty:
             self._event(
                 f"[PARTIAL FILL] {position.symbol}: terisi {order.filled:g} dari {position.planned_qty:g}, "

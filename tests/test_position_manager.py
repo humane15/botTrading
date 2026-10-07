@@ -261,3 +261,19 @@ async def test_live_partial_fill_mengirim_oco_dan_stop_sesuai_jumlah_terisi(tmp_
     assert runner_call.args[:4] == (SYMBOL, "market", "sell", 0.599)
     assert runner_call.args[5]["stopLossPrice"] == 98.0
     assert store.get(position.id).stop_b_client_id == runner_call.args[5]["newClientOrderId"]
+
+
+async def test_dust_dicatat_terpisah_dari_pnl(store):
+    ex = PaperExecutor({SYMBOL: sol_rules(step_size=0.1, min_qty=0.1)}, starting_balance=1000)
+    ex.set_price(SYMBOL, 100)
+    manager, _ = build(store, ex)
+    start_equity = ex.equity()
+    position = await manager.open_position(make_signal(), 2.0)
+    assert position.qty == 1.9 and position.dust_qty == pytest.approx(0.098)  # 2 - fee 0.002, dibulatkan ke step 0.1
+    assert position.cost_per_unit == pytest.approx(position.cost_quote / 1.998)
+    assert position.risk_amount == pytest.approx(1.9 * (position.cost_per_unit - 98 * 0.9995 * 0.999))
+    position = await manager.close_position(position, "manual")
+    dust_value = ex.equity() - ex.free["USDT"]
+    assert dust_value == pytest.approx(0.098 * 100)  # dust tetap di akun dan tetap bernilai
+    expected = position.realized_pnl + dust_value - position.dust_qty * position.cost_per_unit
+    assert ex.equity() - start_equity == pytest.approx(expected, abs=1e-9)

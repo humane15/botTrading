@@ -7,6 +7,7 @@ from helpers import make_settings, make_signal, paper_executor, sol_rules
 
 from core.database import connect
 from core.orders import make_client_id
+from core.paper_exchange import PaperExecutor
 from risk.position_manager import PositionManager
 from risk.positions import CLOSED, FAILED, OPEN, TP1_HIT, Position, PositionStore
 from risk.risk_manager import RiskManager
@@ -158,3 +159,15 @@ async def test_restart_tanpa_masalah(store):
     report = await restart(store, ex)
     assert report.checked == 1 and report.resumed == [label(position)]
     assert not (report.reprotected or report.closed_externally or report.orphan_orders_canceled or report.errors)
+
+
+async def test_dust_milik_bot_bukan_saldo_di_luar_bot(tmp_path, store):
+    ex = PaperExecutor({SYMBOL: sol_rules(step_size=0.1, min_qty=0.1)}, starting_balance=1000)
+    ex.set_price(SYMBOL, 100)
+    manager = PositionManager(store, ex)
+    position = await manager.open_position(make_signal(), 2.0)
+    await manager.close_position(position, "manual")
+    assert ex.free["SOL"] == pytest.approx(0.098)  # dust $9.8, di atas min notional $5
+    risk = RiskManager(make_settings(tmp_path), store, "paper", kill_file=tmp_path / "STOP")
+    report = await restart(store, ex, risk)
+    assert report.untracked == {} and SYMBOL not in risk.blocked_symbols

@@ -228,7 +228,9 @@ def _fingerprint(frame: pd.DataFrame) -> tuple[object, ...]:
     """Identitas isi frame candle tertutup, dipakai sebagai kunci cache analisis."""
     if frame.empty:
         return (0,)
-    return (len(frame), frame.index[0], frame.index[-1], last(frame, "close"), last(frame, "volume"))
+    stamps = getattr(frame.index, "asi8", None)  # int64 langsung, tanpa membuat objek Timestamp
+    first, newest = (int(stamps[0]), int(stamps[-1])) if stamps is not None else (frame.index[0], frame.index[-1])
+    return (len(frame), first, newest, last(frame, "close"), last(frame, "volume"))
 
 
 @dataclass(frozen=True)
@@ -348,27 +350,97 @@ class ConfluenceEngine:
         }
         return tuple(builders[name]() for name in DEFAULT_MODULE_WEIGHTS["trigger"])
 
+    def _timeframe_score(self, tf: str, role: str, signals: Sequence[SignalScore]) -> TimeframeScore:
+        module_weights = {s.name: max(self.weights.get(f"w.{role}.{s.name}", 0.0), 0.0) for s in signals}
+        total = sum(module_weights.values())
+        value = sum(module_weights[s.name] * s.score for s in signals) / total if total > 0 else 0.0
+        return TimeframeScore(
+            timeframe=tf,
+            role=role,
+            score=round(value, 6),
+            aligned=value > self.params.align_threshold,
+            signals=tuple(signals),
+            weights=module_weights,
+        )
+
     def _timeframe_scores(self, signals: Mapping[str, Sequence[SignalScore]]) -> dict[str, TimeframeScore]:
-        scores: dict[str, TimeframeScore] = {}
-        for tf, role in self.params.roles.items():
-            module_weights = {s.name: max(self.weights.get(f"w.{role}.{s.name}", 0.0), 0.0) for s in signals[tf]}
-            total = sum(module_weights.values())
-            value = sum(module_weights[s.name] * s.score for s in signals[tf]) / total if total > 0 else 0.0
-            scores[tf] = TimeframeScore(
-                timeframe=tf,
-                role=role,
-                score=round(value, 6),
-                aligned=value > self.params.align_threshold,
-                signals=tuple(signals[tf]),
-                weights=module_weights,
-            )
-        return scores
+        return {tf: self._timeframe_score(tf, role, signals[tf]) for tf, role in self.params.roles.items()}
+
+    def _timeframe_weights(self) -> tuple[dict[str, float], float]:
+        weights = {tf: max(self.weights.get(f"tf.{role}", 0.0), 0.0) for tf, role in self.params.roles.items()}
+        return weights, sum(weights.values()) or 1.0
+
+    @staticmethod
+    def _trend_rejections(trend: TrendContext, market: MarketContext) -> tuple[str, ...]:
+        """Alasan tolak yang hanya bergantung pada tren 1h dan kondisi pasar (sama dengan evaluasi penuh)."""
+        codes: list[str] = []
+        if trend.direction == TREND_DOWN or trend.ma.score <= -0.3:
+            codes.append("tren_1h_bearish")
+        if not trend.regime.allows_entry:
+            codes.append("regime_turun")
+        if market.circuit_breaker_active:
+            codes.append("circuit_breaker")
+        return tuple(codes)
+
+    def _certain_rejections(
+        self, trend: TrendContext, structure: Sequence[SignalScore], setup: SetupContext, setup_f: pd.DataFrame, market: MarketContext
+    ) -> tuple[str, ...]:
+        """Alasan tolak yang SUDAH PASTI dari timeframe 1h/30m/15m dan kondisi pasar.
+
+        Dipakai evaluate(fast_reject=True) untuk melewati analisis 5m yang hasilnya
+        pasti ditolak. Setiap kode di sini pasti juga muncul pada evaluasi penuh:
+        * jumlah timeframe searah paling banyak (searah di 1h/30m/15m) + 1;
+        * skor paling tinggi dihitung dengan skor 5m = +1 dan penalti yang belum
+          pasti dianggap serendah mungkin.
+        """
+        p = self.params
+        tf_trend, tf_struct, tf_setup, tf_trig = (p.timeframe_of(r) for r in ("trend", "structure", "setup", "trigger"))
+        codes = list(self._trend_rejections(trend, market))
+        higher = {
+            tf_trend: self._timeframe_score(tf_trend, "trend", trend.signals),
+            tf_struct: self._timeframe_score(tf_struct, "structure", structure),
+            tf_setup: self._timeframe_score(tf_setup, "setup", setup.signals),
+        }
+        tags = {tag for ts in higher.values() for signal in ts.signals for tag in signal.tags}
+        if not tags & SETUP_TAGS.get(trend.regime.trend, frozenset()):
+            codes.append("tanpa_setup")
+        if sum(ts.aligned for ts in higher.values()) + 1 < p.min_aligned:
+            codes.append("tf_tidak_searah")
+
+        tf_weights, total_tf = self._timeframe_weights()
+        raw_max = (sum(tf_weights[tf] * ts.score for tf, ts in higher.items()) + tf_weights[tf_trig] * 1.0) / total_tf
+        known = []
+        if trend.direction != TREND_UP:
+            known.append("melawan_tren_1h")
+        rsi_setup = _value(setup_f, "rsi")
+        if is_valid(rsi_setup) and rsi_setup >= p.late_rsi:
+            known.append("entry_terlambat")
+        if market.btc_change_1h <= p.btc_dump_change:
+            known.append("btc_dump")
+        unknown = [c for c in ("dekat_resistance", "volume_lemah", "entry_terlambat") if c not in known]
+        penalty_min = sum(self.weights.get(f"penalty.{c}", 0.0) for c in known)
+        penalty_min += sum(min(self.weights.get(f"penalty.{c}", 0.0), 0.0) for c in unknown)
+        if market.btc_regime is not None and not market.btc_regime.allows_entry:
+            penalty_min += self.weights.get("penalty.btc_turun", 0.0)
+        # 1e-6: cadangan pembulatan float agar batas atas tidak pernah di bawah skor sebenarnya.
+        score_max = round(min(max(50.0 * (1.0 + raw_max - penalty_min) + 1e-6, 0.0), 100.0), 2)
+        if score_max < p.min_score:
+            codes.append("skor_rendah")
+        return tuple(codes)
 
     # ------------------------------------------------------------------
     # Evaluasi utama
     # ------------------------------------------------------------------
-    def evaluate(self, symbol: str, frames: Mapping[str, pd.DataFrame], market: MarketContext | None = None) -> SignalResult:
-        """Nilai satu coin dari frame indikator (lihat prepare_frames) candle tertutup."""
+    def evaluate(
+        self, symbol: str, frames: Mapping[str, pd.DataFrame], market: MarketContext | None = None, *, fast_reject: bool = False
+    ) -> SignalResult:
+        """Nilai satu coin dari frame indikator (lihat prepare_frames) candle tertutup.
+
+        fast_reject=True (dipakai backtest): jika timeframe 1h/30m/15m dan kondisi
+        pasar sudah pasti menolak entry, analisis 5m dilewati dan hasilnya hanya
+        berisi alasan tolak tersebut (skor dan fitur tidak dihitung). Keputusan
+        entry selalu sama dengan evaluasi penuh.
+        """
         p = self.params
         market = market or MarketContext()
         tf_trend, tf_struct, tf_setup, tf_trig = (p.timeframe_of(r) for r in ("trend", "structure", "setup", "trigger"))
@@ -385,19 +457,22 @@ class ConfluenceEngine:
         trend_f, struct_f, setup_f, trig_f = frames[tf_trend], frames[tf_struct], frames[tf_setup], frames[tf_trig]
         trend_key = _fingerprint(trend_f)
         trend: TrendContext = self._cached(symbol, "trend", trend_key, lambda: self._analyze_trend(trend_f))
+        if fast_reject and (early := self._trend_rejections(trend, market)):
+            return self._fast_rejected(symbol, timestamp, trend, market, early)
         structure = self._cached(
             symbol, "structure", (_fingerprint(struct_f), trend.direction), lambda: self._analyze_structure(struct_f, trend)
         )
         setup: SetupContext = self._cached(
             symbol, "setup", (_fingerprint(setup_f), trend_key), lambda: self._analyze_setup(setup_f, trend_f, trend)
         )
+        if fast_reject and (certain := self._certain_rejections(trend, structure, setup, setup_f, market)):
+            return self._fast_rejected(symbol, timestamp, trend, market, certain)
         trigger = self._analyze_trigger(trig_f, trend)
         regime, ma_trend, trend_dir = trend.regime, trend.ma, trend.direction
         signals = {tf_trend: trend.signals, tf_struct: structure, tf_setup: setup.signals, tf_trig: trigger}
         tf_scores = self._timeframe_scores(signals)
 
-        tf_weights = {tf: max(self.weights.get(f"tf.{role}", 0.0), 0.0) for tf, role in p.roles.items()}
-        total_tf = sum(tf_weights.values()) or 1.0
+        tf_weights, total_tf = self._timeframe_weights()
         raw = sum(tf_weights[tf] * tf_scores[tf].score for tf in tf_scores) / total_tf
         aligned = sum(1 for ts in tf_scores.values() if ts.aligned)
 
@@ -453,6 +528,17 @@ class ConfluenceEngine:
     # ------------------------------------------------------------------
     # Pendukung
     # ------------------------------------------------------------------
+    @staticmethod
+    def _fast_rejected(
+        symbol: str, timestamp: pd.Timestamp | None, trend: TrendContext, market: MarketContext, codes: tuple[str, ...]
+    ) -> SignalResult:
+        """Hasil ringkas penolakan cepat: hanya `rejections` yang bermakna."""
+        return SignalResult(
+            symbol=symbol, timestamp=timestamp, score=0.0, raw_score=0.0, aligned=0, timeframes={},
+            regime=trend.regime, market=market, plan=None, reasons=(), pattern="", tags=(), conditions=(),
+            penalty=0.0, rejections=codes, features={"fast_reject": 1.0},
+        )
+
     def _trade_plan(self, frames: Mapping[str, pd.DataFrame], zones: Sequence[Zone], leg: FibLeg | None) -> TradePlan:
         p = self.params
         entry = _value(frames[p.timeframe_of("trigger")], "close")

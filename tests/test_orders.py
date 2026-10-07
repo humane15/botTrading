@@ -14,6 +14,7 @@ from core.orders import (
     OrderError,
     SymbolRules,
     _fmt,
+    ceil_to_step,
     floor_to_step,
     is_bot_order,
     make_client_id,
@@ -63,6 +64,15 @@ def test_pembulatan_presisi_tanpa_galat_float():
     assert rules.price_down(100.019) == 100.01
     assert rules.price_up(100.011) == 100.02
     assert rules.price_round(100.015) == 100.02
+
+
+def test_derau_float_tidak_membuang_satu_step():
+    remaining = 8.463 - 4.231  # 4.231999999999999 di float
+    assert remaining != 4.232 and floor_to_step(remaining, 0.001) == 4.232
+    assert ceil_to_step(104.00000000000001, 0.01) == 104.0
+    assert floor_to_step(100_000_000 - 1e-8, 1.0) == 100_000_000  # jumlah besar (misal PEPE)
+    assert floor_to_step(4.23199999, 0.001) == 4.231  # memang kurang dari kelipatan: tetap dibulatkan ke bawah
+    assert ceil_to_step(104.001, 0.01) == 104.01
 
 
 def test_cek_min_notional_dan_jumlah():

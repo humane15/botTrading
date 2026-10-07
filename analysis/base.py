@@ -64,17 +64,32 @@ def has_columns(frame: pd.DataFrame, *columns: str) -> bool:
     return all(column in frame.columns for column in columns)
 
 
+def column_values(frame: pd.DataFrame, column: str) -> np.ndarray:
+    """Isi satu kolom sebagai array numpy read only, tanpa membuat Series pandas.
+
+    Fungsi analisis dipanggil puluhan kali per coin per candle (dan jutaan kali
+    di backtest), sedangkan membuat Series pandas makan waktu sekitar 10 mikrodetik.
+    `_get_column_array` adalah jalur internal pandas yang membaca array kolom
+    langsung; jika suatu saat tidak ada, dipakai jalur publik yang lebih lambat.
+    """
+    loc = frame.columns.get_loc(column)
+    getter = getattr(frame, "_get_column_array", None)
+    values = np.asarray(getter(loc) if getter is not None else frame.iloc[:, loc].to_numpy(), dtype="float64")
+    view = values.view()
+    view.flags.writeable = False
+    return view
+
+
 def last(frame: pd.DataFrame, column: str, offset: int = 1) -> float:
     """Nilai `column` pada candle ke-`offset` dari belakang (1 = candle terakhir).
 
-    Mengembalikan NaN jika kolom tidak ada atau data kurang. Memakai akses
-    numpy langsung karena jauh lebih cepat daripada membuat baris pandas.
+    Mengembalikan NaN jika kolom tidak ada atau data kurang.
     """
     if column not in frame.columns or len(frame) < offset:
         return float("nan")
-    return float(frame.iat[-offset, frame.columns.get_loc(column)])
+    return float(column_values(frame, column)[-offset])
 
 
 def tail(frame: pd.DataFrame, column: str, count: int) -> np.ndarray:
-    """`count` nilai terakhir dari `column` sebagai array numpy."""
-    return frame[column].to_numpy(dtype="float64")[-count:]
+    """`count` nilai terakhir dari `column` sebagai array numpy (read only)."""
+    return column_values(frame, column)[-count:]

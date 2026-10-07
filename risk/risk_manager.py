@@ -97,16 +97,18 @@ class RiskManager:
         *,
         kill_file: Path | None = None,
         clock: Callable[[], datetime] = _utcnow,
+        kill_switch: bool = True,
     ) -> None:
         self.settings = settings
         self.store = store
         self.mode = mode
         self.kill_file = kill_file or settings.kill_switch_file
+        self.kill_switch = kill_switch  # False hanya untuk backtest (file STOP tidak relevan untuk data historis)
         self._clock = clock
         self.blocked_symbols: set[str] = set()
 
     def kill_switch_active(self) -> bool:
-        return self.kill_file.exists()
+        return self.kill_switch and self.kill_file.exists()
 
     def block_symbols(self, symbols: Iterable[str]) -> None:
         self.blocked_symbols.update(symbols)

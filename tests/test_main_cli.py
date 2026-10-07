@@ -1,10 +1,11 @@
-"""Test CLI main.py: gerbang mode live, perintah yang belum tersedia, perintah Fase 1 sampai 3."""
+"""Test CLI main.py: gerbang mode live, perintah yang belum tersedia, perintah Fase 1 sampai 4."""
 
 from __future__ import annotations
 
 import re
 
 import ccxt
+import pandas as pd
 from helpers import (
     T0,
     FakeClock,
@@ -51,7 +52,7 @@ def test_live_lolos_gerbang_tetapi_belum_tersedia(tmp_path, capsys):
 
 
 def test_perintah_fase_berikutnya_belum_tersedia(tmp_path, capsys):
-    for command, phase in (("backtest", 4), ("train", 5), ("paper", 6), ("report", 4)):
+    for command, phase in (("train", 5), ("paper", 6)):
         assert run_cli(tmp_path, [command]) == 2
         assert f"Fase {phase}" in capsys.readouterr().out
 
@@ -187,3 +188,73 @@ def test_positions_database_kosong(tmp_path, capsys):
     assert run_cli(tmp_path, ["positions"]) == 0
     out = capsys.readouterr().out
     assert "Posisi aktif: tidak ada" in out and "Belum ada posisi tertutup" in out
+
+
+# ----------------------------------------------------------------------
+# Fase 4: backtest dan report
+# ----------------------------------------------------------------------
+def make_history(tmp_path, symbols=("BTC/USDT", "AAA/USDT", "BBB/USDT")):
+    from helpers import sol_rules
+    from synthetic import synthetic_market
+
+    from backtest.data import HistoryStore
+
+    store = HistoryStore(tmp_path / "data" / "history")
+    market = synthetic_market(list(symbols), days=16, start="2025-03-01", seed=5)
+    for symbol, frames in market.items():
+        for tf, frame in frames.items():
+            store.save(symbol, tf, frame)
+    store.save_rules({s: sol_rules(symbol=s, base=s.split("/")[0], step_size=1e-6, tick_size=1e-8) for s in symbols})
+    store.save_candidates([s for s in symbols if s != "BTC/USDT"], "uji")
+    return store
+
+
+def test_report_tanpa_hasil_backtest(tmp_path, capsys):
+    assert run_cli(tmp_path, ["report"]) == 1
+    assert "Belum ada hasil backtest" in capsys.readouterr().err
+
+
+def test_backtest_offline_tanpa_data(tmp_path, capsys):
+    assert run_cli(tmp_path, ["backtest", "--offline"]) == 1
+    assert "Belum ada data historis" in capsys.readouterr().err
+
+
+def test_backtest_offline_lalu_report(tmp_path, capsys):
+    make_history(tmp_path)
+    args = ["backtest", "--offline", "--start", "2025-03-13", "--end", "2025-03-15", "--capital", "1000", "--workers", "1"]
+    assert run_cli(tmp_path, args) == 0
+    out = capsys.readouterr().out
+    assert "HASIL BACKTEST" in out and "2025-03-13 00:00 s/d 2025-03-15 00:00" in out
+    runs = list((tmp_path / "data" / "backtests").iterdir())
+    assert len(runs) == 1 and (runs[0] / "trades.csv").exists()
+    assert run_cli(tmp_path, ["report"]) == 0
+    assert "HASIL BACKTEST" in capsys.readouterr().out
+
+
+def test_backtest_tanggal_tidak_valid(tmp_path, capsys):
+    make_history(tmp_path)
+    assert run_cli(tmp_path, ["backtest", "--offline", "--start", "2025-03-15", "--end", "2025-03-13"]) == 1
+    assert "tanggal mulai harus sebelum tanggal akhir" in capsys.readouterr().err
+
+
+async def test_backtest_mengunduh_data_lewat_api_mock(tmp_path, settings, mock_exchange, capsys):
+    import argparse
+
+    from helpers import T0, FakeClock, FakeKlineServer
+
+    from backtest.data import HistoryStore, history_dir
+
+    markets = {s: make_market(s.split("/")[0]) for s in ("AAA/USDT", "BTC/USDT")}
+    install_markets(mock_exchange, markets)
+    mock_exchange.fetch_ohlcv.side_effect = FakeKlineServer(FakeClock(T0)).fetch_ohlcv
+    client = ExchangeClient(settings, mock_exchange, jitter=0)
+    end = pd.Timestamp(T0, unit="ms", tz="UTC").floor("D")
+    args = argparse.Namespace(
+        start=str((end - pd.Timedelta(days=1)).date()), end=str(end.date()), months=6, capital=500.0,
+        symbols="AAA/USDT", candidates=None, workers=1, oos_fraction=1 / 3, offline=False,
+    )
+    assert await main.run_backtest(settings, args, client=client) == 0
+    out = capsys.readouterr().out
+    assert "Data historis: 2 coin" in out and "HASIL BACKTEST" in out
+    store = HistoryStore(history_dir(settings))
+    assert store.has("AAA/USDT", "5m") and store.has("BTC/USDT", "1h") and "AAA/USDT" in store.load_rules()

@@ -7,9 +7,10 @@ Contoh pemakaian:
     python main.py analyze SOL/USDT      analisis lengkap satu coin (skor, alasan, rencana)
     python main.py scan --top 10         analisis semua coin universe, tampilkan sinyal teratas
     python main.py positions             posisi aktif dan riwayat posisi (dari database)
-    python main.py backtest              backtest (Fase 4)
+    python main.py backtest              backtest 6 bulan pada universe 75 coin (unduh data otomatis)
+    python main.py backtest --offline    backtest ulang memakai data yang sudah diunduh
+    python main.py report                tampilkan laporan backtest terakhir
     python main.py train                 latih model ML (Fase 5)
-    python main.py report                laporan performa (Fase 4 dan 5)
     python main.py paper                 paper trading (Fase 6)
     python main.py live --confirm-live   live trading (Fase 7, butuh TRADING_MODE=live)
 """
@@ -18,9 +19,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, TypeVar
 
 import ccxt
@@ -38,6 +41,10 @@ from analysis.confluence import (
 )
 from analysis.regime import CircuitBreaker, MarketContext, analyze_market
 from analysis.weights import WeightStore
+from backtest.data import HistoryStore, download_history, history_dir
+from backtest.engine import BacktestConfig, Backtester
+from backtest.report import build_report, latest_run, save_report
+from backtest.signals import StoreSource
 from config.logging_setup import setup_logging
 from config.settings import (
     DEFAULT_ENV_FILE,
@@ -54,7 +61,7 @@ from risk.positions import DUST, PENDING, Position, PositionStore
 T = TypeVar("T")
 
 # Perintah yang belum diimplementasikan beserta fase pengerjaannya.
-PENDING_PHASE = {"backtest": 4, "report": 4, "train": 5, "paper": 6, "live": 7}
+PENDING_PHASE = {"train": 5, "paper": 6, "live": 7}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,8 +85,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_positions = sub.add_parser("positions", help="posisi aktif dan riwayat posisi dari database")
     p_positions.add_argument("--limit", type=int, default=10, help="jumlah posisi tertutup terakhir yang ditampilkan (default 10)")
 
-    sub.add_parser("backtest", help="jalankan backtest (Fase 4)")
-    sub.add_parser("report", help="laporan performa (Fase 4 dan 5)")
+    p_backtest = sub.add_parser("backtest", help="backtest event driven pada data historis Binance")
+    p_backtest.add_argument("--months", type=int, default=6, help="panjang periode dalam bulan (default 6)")
+    p_backtest.add_argument("--start", help="tanggal mulai YYYY-MM-DD (UTC), menggantikan --months")
+    p_backtest.add_argument("--end", help="tanggal akhir YYYY-MM-DD (UTC, default hari ini pukul 00:00)")
+    p_backtest.add_argument("--capital", type=float, default=None, help="modal awal USDT (default PAPER_START_BALANCE)")
+    p_backtest.add_argument("--symbols", help="daftar coin dipisah koma, contoh SOL/USDT,ETH/USDT (default kandidat universe)")
+    p_backtest.add_argument("--candidates", type=int, default=None, help="jumlah kandidat coin yang diunduh (default 1.4 x UNIVERSE_SIZE)")
+    p_backtest.add_argument("--workers", type=int, default=None, help="jumlah proses paralel (default jumlah CPU, maksimal 8)")
+    p_backtest.add_argument("--oos-fraction", type=float, default=1 / 3, help="porsi akhir periode untuk segmen B / out of sample (default 1/3)")
+    p_backtest.add_argument("--offline", action="store_true", help="pakai data yang sudah diunduh, tanpa koneksi ke Binance")
+
+    p_report = sub.add_parser("report", help="tampilkan laporan backtest terakhir")
+    p_report.add_argument("--run", help="folder hasil backtest tertentu (default yang terbaru di data/backtests)")
     sub.add_parser("train", help="latih ulang model machine learning (Fase 5)")
     sub.add_parser("paper", help="paper trading dengan harga live dan saldo virtual (Fase 6)")
     p_live = sub.add_parser("live", help="live trading dengan uang sungguhan (Fase 7)")
@@ -162,7 +180,7 @@ def build_engine(settings: Settings) -> ConfluenceEngine:
 
 
 def build_breaker(settings: Settings) -> CircuitBreaker:
-    return CircuitBreaker(drop_threshold=settings.circuit_breaker_drop, cooldown=pd.Timedelta(hours=settings.circuit_breaker_hours))
+    return CircuitBreaker.from_settings(settings)
 
 
 async def market_context(
@@ -295,6 +313,104 @@ def run_positions(settings: Settings, limit: int = 10) -> int:
     return 0
 
 
+def _utc_date(text: str) -> pd.Timestamp:
+    return pd.Timestamp(text).tz_localize("UTC") if pd.Timestamp(text).tzinfo is None else pd.Timestamp(text).tz_convert("UTC")
+
+
+def backtest_window(args: argparse.Namespace, now: datetime | None = None) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Periode backtest: default `months` bulan terakhir yang sudah lengkap (sampai hari ini 00:00 UTC)."""
+    end = _utc_date(args.end) if args.end else pd.Timestamp(now or datetime.now(timezone.utc)).tz_convert("UTC").floor("D")
+    start = _utc_date(args.start) if args.start else end - pd.DateOffset(months=args.months)
+    if start >= end:
+        raise ValueError("tanggal mulai harus sebelum tanggal akhir")
+    return start, end
+
+
+def backtests_dir(settings: Settings) -> Path:
+    return settings.data_dir / "backtests"
+
+
+async def run_backtest(settings: Settings, args: argparse.Namespace, client: ExchangeClient | None = None) -> int:
+    start, end = backtest_window(args)
+    store = HistoryStore(history_dir(settings))
+    btc = settings.btc_symbol
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    else:
+        symbols = store.load_candidates() if args.offline else []
+
+    if not args.offline:
+        async def download(c: ExchangeClient) -> None:
+            nonlocal symbols
+            if not symbols:
+                count = args.candidates or round(settings.universe_size * 1.4)
+                wide = settings.model_copy(update={"universe_size": count, "min_quote_volume_usd": 0.0})
+                symbols = (await UniverseSelector(c, wide).build()).symbols
+                store.save_candidates(symbols, "binance")
+                print(f"Kandidat: {len(symbols)} coin dengan volume 24 jam terbesar saat ini (dipilih ulang per hari di backtest)")
+            print(f"Mengunduh data {start:%Y-%m-%d} s/d {end:%Y-%m-%d} + pemanasan 1000 candle per timeframe ...")
+            report = await download_history(
+                c, settings, store, list(dict.fromkeys([*symbols, btc])), int(start.value // 1_000_000), int(end.value // 1_000_000), progress=print,
+            )
+            print(report.text())
+
+        if client is not None:
+            await download(client)
+        else:
+            async with ExchangeClient(settings) as own_client:
+                await download(own_client)
+
+    if not symbols:
+        print("Belum ada data historis. Jalankan tanpa --offline agar data diunduh dari Binance.", file=sys.stderr)
+        return 1
+    rules = store.load_rules()
+    missing = [s for s in dict.fromkeys([*symbols, btc]) if s not in rules or not store.has(s, settings.timeframes[0])]
+    if btc in missing:
+        print(f"Data {btc} belum ada (dibutuhkan untuk regime BTC dan circuit breaker).", file=sys.stderr)
+        return 1
+    if missing:
+        print(f"Dilewati karena data belum ada: {', '.join(missing)}")
+    config = BacktestConfig(
+        start=start,
+        end=end,
+        initial_capital=args.capital or settings.paper_start_balance,
+        universe_size=settings.universe_size,
+        min_quote_volume=settings.min_quote_volume_usd,
+        workers=max(1, args.workers or min(os.cpu_count() or 1, 8)),  # tiap proses sekitar 300 MB RAM
+        oos_fraction=args.oos_fraction,
+    )
+    weights = WeightStore.open(settings.db_path)
+    try:
+        snapshot = dict(weights.snapshot())
+    finally:
+        weights.conn.close()
+    backtester = Backtester(
+        settings,
+        config,
+        source=StoreSource(str(store.root), tuple(settings.timeframes)),
+        rules=rules,
+        symbols=[s for s in symbols if s not in missing],
+        weights=snapshot,
+        progress=print,
+    )
+    result = await backtester.run()
+    report = build_report(result)
+    folder = save_report(result, report, backtests_dir(settings) / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
+    print(report.text)
+    print(f"File hasil (trades.csv, equity.csv, report.json, journal.db): {folder}")
+    return 0
+
+
+def run_report(settings: Settings, run: str | None = None) -> int:
+    folder = Path(run) if run else latest_run(backtests_dir(settings))
+    if folder is None or not (folder / "report.txt").exists():
+        print("Belum ada hasil backtest. Jalankan dulu: python main.py backtest", file=sys.stderr)
+        return 1
+    print((folder / "report.txt").read_text(encoding="utf-8"), end="")
+    print(f"Folder: {folder}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -318,7 +434,11 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
     settings.ensure_dirs()
     if args.command == "positions":
         return run_positions(settings, args.limit)
+    if args.command == "report":
+        return run_report(settings, args.run)
     try:
+        if args.command == "backtest":
+            return run_async(run_backtest(settings, args))
         if args.command == "universe":
             return run_async(_with_client(settings, lambda c: run_universe(settings, c, args.refresh, args.top)))
         if args.command == "fetch":
@@ -329,6 +449,9 @@ def main(argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None
             return run_async(_with_client(settings, lambda c: run_scan(settings, c, args.top)))
     except ccxt.BaseError as exc:
         print(f"Gagal terhubung ke Binance: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"Backtest tidak bisa dijalankan: {exc}", file=sys.stderr)
         return 1
     return 1  # pragma: no cover  (argparse sudah membatasi pilihan perintah)
 

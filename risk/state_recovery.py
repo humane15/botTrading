@@ -13,6 +13,8 @@ Wajib dijalankan SEBELUM scanning pertama setelah restart. Langkahnya:
    manual dibiarkan dan dilaporkan sebagai error.
 3. Saldo coin lain yang bukan milik posisi bot dan bernilai di atas min notional
    dilaporkan dan coin itu diblokir dari entry baru (agar eksposur tidak dobel).
+   Dust yang ditinggalkan posisi bot sendiri (sisa di bawah step size) tidak
+   dihitung sebagai saldo di luar bot.
 4. Order milik bot (client id berawalan "tb-") yang tidak terhubung ke posisi
    aktif dibatalkan agar tidak tereksekusi tanpa pengawasan.
 """
@@ -105,8 +107,10 @@ async def recover_state(manager: PositionManager, quote: str, risk: RiskManager 
     balances = await executor.balances()
     active = manager.store.active(manager.mode)
     tracked = {p.base for p in active}
+    bot_dust = manager.store.dust_by_asset(manager.mode)
     for asset, (_, total) in balances.items():
-        if asset == quote or asset in tracked or total <= 0:
+        total -= bot_dust.get(asset, 0.0)
+        if asset == quote or asset in tracked or total <= 1e-12:
             continue
         symbol = f"{asset}/{quote}"
         try:

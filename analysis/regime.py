@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from analysis.base import is_valid, last
+from config.settings import Settings
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +115,10 @@ class CircuitBreaker:
     active_until: pd.Timestamp | None = None
     last_drop: float = 0.0
     last_change: float = 0.0
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> CircuitBreaker:
+        return cls(drop_threshold=settings.circuit_breaker_drop, cooldown=pd.Timedelta(hours=settings.circuit_breaker_hours))
 
     def update(self, btc: pd.DataFrame, now: pd.Timestamp | None = None) -> bool:
         """Perbarui status dari candle BTC tertutup (disarankan 5m). Mengembalikan status aktif."""

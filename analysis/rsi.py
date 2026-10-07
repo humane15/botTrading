@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from analysis.base import SignalScore, has_columns, is_valid, last
+from analysis.base import SignalScore, column_values, has_columns, is_valid, last
 from analysis.moving_average import TREND_DOWN, TREND_UP
 from analysis.pivots import find_pivots
 
@@ -34,7 +34,7 @@ def detect_divergence(frame: pd.DataFrame, params: RSIParams = RSIParams()) -> s
     if not has_columns(frame, "rsi") or len(frame) < params.pivot_left + params.pivot_right + 2:
         return None
     highs, lows = find_pivots(frame, params.pivot_left, params.pivot_right, params.divergence_lookback)
-    rsi = frame["rsi"].to_numpy(dtype="float64")
+    rsi = column_values(frame, "rsi")
     last = len(frame) - 1
     found: list[tuple[int, str]] = []
 
