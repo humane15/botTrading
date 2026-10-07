@@ -1,0 +1,8 @@
+# Dependensi inti bot (Fase 1).
+# Dependensi fase berikutnya (indikator, machine learning, Telegram)
+# ditambahkan saat fase tersebut dikerjakan.
+ccxt>=4.4,<5
+pandas>=2.2
+numpy>=1.26
+pydantic>=2.6,<3
+python-dotenv>=1.0
